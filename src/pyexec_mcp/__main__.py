@@ -12,14 +12,24 @@ import os
 import sys
 
 from . import server
+from .config import DEFAULT_HOST, DEFAULT_PORT
 
 #: Flag -> environment variable. The flag wins when both are present.
+#:
+#: ``host`` and ``port`` are here because the download links this server hands
+#: out are built from the address clients reach it at, which is derived from
+#: them. Leaving them out would let ``--port`` disagree with the URL the tools
+#: produce.
 ENV_KEYS = {
+    "host": "PYEXEC_HOST",
+    "port": "PYEXEC_PORT",
+    "base_url": "PYEXEC_BASE_URL",
     "workspace": "PYEXEC_WORKSPACE",
     "python": "PYEXEC_PYTHON",
     "timeout": "PYEXEC_TIMEOUT",
     "max_timeout": "PYEXEC_MAX_TIMEOUT",
     "max_output_chars": "PYEXEC_MAX_OUTPUT_CHARS",
+    "download_ttl": "PYEXEC_DOWNLOAD_TTL",
     "allowed_modules": "PYEXEC_ALLOWED_MODULES",
     "auth_token": "PYEXEC_AUTH_TOKEN",
     "auth_token_file": "PYEXEC_AUTH_TOKEN_FILE",
@@ -43,14 +53,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("PYEXEC_HOST", "0.0.0.0"),
+        default=os.environ.get("PYEXEC_HOST", DEFAULT_HOST),
         help="Bind address for the streamable-http transport.",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PYEXEC_PORT", "8000")),
+        default=int(os.environ.get("PYEXEC_PORT", str(DEFAULT_PORT))),
         help="Port for the streamable-http transport.",
+    )
+    parser.add_argument(
+        "--base-url",
+        help=(
+            "Address clients use to reach this server, used to build the "
+            "download links pyexec_get_download_url returns. Defaults to the "
+            "bind address above; set it when that is not what clients dial "
+            "(NAT, port forward, reverse proxy)."
+        ),
+    )
+    parser.add_argument(
+        "--download-ttl",
+        type=float,
+        help=(
+            "Seconds a signed download link stays valid. Also the ceiling for "
+            "the lifetime a tool call asks for."
+        ),
     )
     parser.add_argument(
         "--workspace",

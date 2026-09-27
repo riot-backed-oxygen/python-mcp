@@ -82,6 +82,7 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `pyexec_read_file` | 读取工作区内的文本文件 |
 | `pyexec_write_file` | 写入工作区内的文件 |
 | `pyexec_list_files` | 列出工作区文件，支持 glob 和递归 |
+| `pyexec_get_download_url` | 生成一个带签名的限时下载地址，浏览器直接点开 |
 | `pyexec_list_packages` | 列出可 import 的已安装包 |
 | `pyexec_install_package` | 安装依赖到执行代码所用的解释器 |
 
@@ -94,6 +95,7 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 需要干净环境 / 可能崩？    → pyexec_run_isolated
 跑的是已存在的文件？       → pyexec_run_script
 会话里状态乱了想重来？     → pyexec_reset_session
+要把生成的文件给人？       → pyexec_get_download_url
 ```
 
 ---
@@ -112,6 +114,8 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `PYEXEC_ALLOWED_MODULES` | 未设置 | 允许 import 的顶层模块白名单，逗号分隔 |
 | `PYEXEC_INHERIT_ENV` | `1` | 是否让 worker 继承服务器环境变量 |
 | `PYEXEC_ENV_FILE` | `.env` | 启动时合并这个文件里的变量 |
+| `PYEXEC_BASE_URL` | 由 `--host`/`--port` 推导 | 客户端访问本服务的地址，用于拼下载链接 |
+| `PYEXEC_DOWNLOAD_TTL` | `3600` | 下载链接有效期（秒），也是单次请求能要到的上限 |
 | `PYEXEC_AUTH_TOKEN` | 未设置 | streamable-http 的 Bearer 令牌，至少 16 字符 |
 | `PYEXEC_AUTH_TOKEN_FILE` | 未设置 | 从文件读令牌；`PYEXEC_AUTH_TOKEN` 优先 |
 
@@ -123,6 +127,7 @@ Python 不会自己读 `.env`，所以启动时 server 会主动合并工作目�
 # .env
 PYEXEC_AUTH_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(32))">
 PYEXEC_WORKSPACE=D:/develop/vibecoding/python-mcp
+PYEXEC_BASE_URL=http://192.168.1.10:8000
 PYEXEC_TIMEOUT=30
 ```
 
@@ -190,6 +195,45 @@ export PYEXEC_AUTH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe
 
 ---
 
+## 文件下载（只对 streamable-http 生效）
+
+代码生成的东西——图表、报表、导出的 csv——没地方去：`pyexec_read_file` 只能把内容读回模型上下文，二进制读不了，大文件还会挤爆上下文。所以配一个 HTTP 下载接口：
+
+```
+GET <PYEXEC_BASE_URL>/download/<工作区内的相对路径>?exp=<unix 秒>&sig=<hmac>
+```
+
+`pyexec_get_download_url` 就是用来生成这个地址的，拿到后直接丢给用户点：
+
+```python
+# 在会话里画完图之后
+pyexec_get_download_url("chart.png")
+# -> http://192.168.1.10:8000/download/chart.png?exp=1759046400&sig=9f2c...
+```
+
+`--base-url` / `PYEXEC_BASE_URL` 决定链接的前缀。默认按 `--host`/`--port` 推导，但**只有你知道客户端到底怎么访问这台机器**——中间可能有 NAT、端口转发、反向代理，都不体现在绑定地址上，所以这几种情况要显式配。绑 `0.0.0.0` 时推导出来的是本机出口网卡地址（拿不到就回落 `127.0.0.1`），因为「监听所有网卡」本身不是一个能拨号的地址。值里可以带路径前缀（`https://host/pyexec`），要求反代把前缀剥掉再转发。
+
+**为什么是签名，而不是让下载也带 Bearer 头？** 因为链接的全部意义是人能在浏览器里点开，而浏览器导航带不上 `Authorization` 头。把令牌塞进 query string 又违反上面鉴权那一节的原则——URL 会漏进 access log、`Referer`、浏览器历史。签名是第三个选项：密钥派生自 `PYEXEC_AUTH_TOKEN`（URL 里没有令牌本身），覆盖「这一个路径 + 这一个到期时间」，所以
+
+- 改路径、改到期时间、换个令牌签，都直接 401
+- 链接泄露只暴露**一个文件**、且**有时限**，而不是整个工作区的永久通行证
+- 换掉 `PYEXEC_AUTH_TOKEN` 就等于作废所有已发出的链接
+
+签名是对**解析后的工作区相对路径**做的，不是 URL 里那串原始文本，所以 `%2e%2e%2f`、重复斜杠之类的写法不影响校验；路径囚笼仍然是 `resolve_within`，越界一律 403。
+
+**没配令牌时下载接口不要求签名。** 这不是漏的：启动联锁保证「无令牌 ⇒ 只能绑 loopback」，此时能访问这个端口的本来就只有本机，和 MCP 端点在 loopback 上不鉴权是同一个道理。带上正确的 Bearer 头也能下载，方便 curl 和脚本。
+
+有效期默认 1 小时，`PYEXEC_DOWNLOAD_TTL` 改。这个是**上限**不是默认值：单次调用可以要短一点，要不了更长——能决定「链接泄露后危险多久」的应该是运维配置，不是某一次工具调用。
+
+```bash
+# 本机 HTTP_PROXY 存在时记得 --noproxy，否则请求会被代理截走
+curl -sS --noproxy '*' -O -J "http://127.0.0.1:8000/download/chart.png?exp=...&sig=..."
+```
+
+实现上还有两点：路由用的是**纯 ASGI 前置门**（`downloads.py`），不是 Starlette 的 `Mount`——`Mount` 不会把 lifespan 转发给子应用，挂上去 streamable-http 的 session manager 就起不来，每个请求都会以 `RuntimeError: Task group is not initialized` 失败。它也**故意放在 Bearer 中间件之外**，自己校验签名，否则那道门拦下的正好是它要服务的请求。文件响应复用 Starlette 的 `FileResponse`，因此自带流式发送、`Range`（下载可断点续传）、`ETag`，并按扩展名给出 `Content-Type`。
+
+---
+
 ## 安全边界
 
 **这不是沙箱，请当它没有隔离来用。** 这个 server 的全部意义就是执行任意 Python，而任意 Python 可以绕过任何运行在同一解释器内的检查——`PYEXEC_ALLOWED_MODULES` 挡得住手滑，挡不住存心。代码跑起来后，它对这台机器的权限和 server 进程本身完全一样。
@@ -203,6 +247,7 @@ export PYEXEC_AUTH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe
 - **输出截断**：防止一段死循环 print 撑爆上下文
 - **`PYEXEC_INHERIT_ENV=0`**：worker 只拿到 `PATH`/`TEMP` 等启动所需变量，API key 之类的凭据不外泄
 - **Bearer 鉴权 + 启动联锁**：streamable-http 在非 loopback 地址上没配令牌就拒绝启动
+- **限时签名下载链接**：下载地址只能访问签名覆盖的那一个文件，过期即失效，唯一密钥来自 `PYEXEC_AUTH_TOKEN`；路径同样是工作区囚笼
 
 真要隔离，请用容器、虚拟机或受限用户账户——把整个 server 关在里面，而不是指望这一层。
 
@@ -214,10 +259,11 @@ export PYEXEC_AUTH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe
 MCP client
     │  stdio / streamable-http
     ▼
-server.py          MCPServer + 10 个工具，把 Settings 和 Session 串起来
+server.py          MCPServer + 11 个工具，把 Settings 和 Session 串起来
     │
     ├── auth.py       streamable-http 的 Bearer 中间件 + 启动联锁
-    ├── config.py     Settings：环境变量 → 配置，含令牌校验
+    ├── downloads.py  /download 前置门：签名链接、路径囚笼、FileResponse
+    ├── config.py     Settings：环境变量 → 配置，含令牌校验与 base URL 推导
     ├── dotenv.py     极简 .env 读取（不引 python-dotenv）
     ├── sandbox.py     AST import 白名单、路径囚笼（进 worker 之前）
     ├── packages.py    pip 安装 / 列举

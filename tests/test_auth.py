@@ -2,12 +2,6 @@
 
 from __future__ import annotations
 
-import os
-import socket
-import subprocess
-import sys
-import time
-
 import httpx
 import pytest
 
@@ -261,30 +255,6 @@ def test_public_host_with_a_token_is_allowed(tmp_path, make_settings, monkeypatc
 # Live HTTP server
 # --------------------------------------------------------------------------
 
-def free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-def wait_until_listening(url: str, timeout: float = 30.0) -> None:
-    """Poll until the server answers.
-
-    ``trust_env=False`` matters here: with a proxy configured in the
-    environment, httpx would route these loopback requests through it and the
-    proxy's error response would look like a server that is already up.
-    """
-    deadline = time.monotonic() + timeout
-    with httpx.Client(trust_env=False, timeout=1.0) as client:
-        while time.monotonic() < deadline:
-            try:
-                client.get(url)
-                return
-            except httpx.TransportError:
-                time.sleep(0.25)
-    raise AssertionError(f"server at {url} never started listening")
-
-
 MCP_HEADERS = {
     "Content-Type": "application/json",
     "Accept": "application/json, text/event-stream",
@@ -301,45 +271,9 @@ INITIALIZE = {
 }
 
 
-@pytest.fixture
-def live_server(tmp_path):
-    """A real streamable-http server, started with a token, on a free port."""
-    port = free_port()
-    env = dict(os.environ)
-    env["PYEXEC_AUTH_TOKEN"] = TOKEN
-    env["PYEXEC_WORKSPACE"] = str(tmp_path)
-    # Ignore any .env the developer has in the project root; this test supplies
-    # its own configuration and should not care what else is lying around.
-    env["PYEXEC_ENV_FILE"] = str(tmp_path / "no-such.env")
-
-    proc = subprocess.Popen(
-        [
-            sys.executable,
-            "-m",
-            "pyexec_mcp",
-            "--transport",
-            "streamable-http",
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-        ],
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
-    url = f"http://127.0.0.1:{port}/mcp"
-    try:
-        wait_until_listening(url)
-        yield url
-    finally:
-        proc.kill()
-        proc.wait(timeout=10)
-
-
 def test_live_server_rejects_a_request_without_a_token(live_server):
     with httpx.Client(trust_env=False, timeout=10) as client:
-        response = client.post(live_server, json=INITIALIZE, headers=MCP_HEADERS)
+        response = client.post(live_server.url, json=INITIALIZE, headers=MCP_HEADERS)
 
     assert response.status_code == 401
     assert "www-authenticate" in {k.lower() for k in response.headers}
@@ -348,7 +282,7 @@ def test_live_server_rejects_a_request_without_a_token(live_server):
 def test_live_server_rejects_a_wrong_token(live_server):
     with httpx.Client(trust_env=False, timeout=10) as client:
         response = client.post(
-            live_server,
+            live_server.url,
             json=INITIALIZE,
             headers={**MCP_HEADERS, "Authorization": "Bearer wrong-token-entirely"},
         )
@@ -359,9 +293,9 @@ def test_live_server_rejects_a_wrong_token(live_server):
 def test_live_server_accepts_the_right_token(live_server):
     with httpx.Client(trust_env=False, timeout=10) as client:
         response = client.post(
-            live_server,
+            live_server.url,
             json=INITIALIZE,
-            headers={**MCP_HEADERS, "Authorization": f"Bearer {TOKEN}"},
+            headers={**MCP_HEADERS, "Authorization": f"Bearer {live_server.token}"},
         )
 
     assert response.status_code == 200

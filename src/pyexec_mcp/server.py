@@ -14,6 +14,8 @@ import atexit
 import os
 import sys
 import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -24,6 +26,7 @@ from pydantic import BaseModel, Field
 from . import packages
 from .auth import BearerTokenMiddleware
 from .config import Settings, is_loopback
+from .downloads import DOWNLOAD_PREFIX, DownloadRouter, build_url, workspace_relative
 from .sandbox import GuardrailError, check_code, resolve_within
 from .session import ExecutionSession, run_isolated
 
@@ -168,6 +171,18 @@ class WriteReceipt(BaseModel):
     path: str
     bytes_written: int
     created: bool = Field(description="True if the file did not exist before")
+
+
+class DownloadLink(BaseModel):
+    """A time-limited URL that downloads one file, for a browser to click."""
+
+    url: str = Field(description="Complete URL; opening it downloads the file")
+    path: str = Field(description="Workspace-relative path the link was signed for")
+    filename: str = Field(description="Name the browser will save it as")
+    size_bytes: int
+    expires_at: str = Field(description="ISO 8601 UTC time the link stops working")
+    expires_in_seconds: int
+    note: str = Field(description="Caveats the caller should know about this link")
 
 
 class PackageList(BaseModel):
@@ -737,6 +752,116 @@ def pyexec_list_files(
 
 
 # --------------------------------------------------------------------------
+# Download tool
+# --------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pyexec_get_download_url",
+    title="Get a download link for a workspace file",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=False,
+    ),
+)
+def pyexec_get_download_url(
+    path: Annotated[
+        str, Field(description="File path, absolute or relative to the workspace.")
+    ],
+    ttl_seconds: Annotated[
+        float | None,
+        Field(description="How long the link should stay valid, in seconds."),
+    ] = None,
+) -> DownloadLink:
+    """Build a URL that downloads a file from the workspace.
+
+    Use this to hand a person something they can actually open -- a chart, a
+    report, an archive, anything binary or too large to usefully pass through
+    the conversation. The URL goes straight to their browser; the file never
+    travels through the model context.
+
+    Only works on the streamable-http transport, since a stdio server has no
+    address to link to. The link is signed and time-limited: it works for
+    `ttl_seconds` (default 1 hour) and grants access to that one file only.
+    Rotating PYEXEC_AUTH_TOKEN invalidates every link already handed out.
+
+    Args:
+        path: File to link to. Must resolve inside the workspace, like the
+            other file tools.
+        ttl_seconds: Requested lifetime. Capped at the configured
+            PYEXEC_DOWNLOAD_TTL, which is the ceiling rather than a default.
+
+    Returns:
+        DownloadLink: `url` plus the `filename`, `size_bytes` and
+        `expires_at` the caller needs to describe it. `note` carries any
+        caveat about this particular link.
+
+    Examples:
+        - "Show me the chart you just made" -> plot it to a .png from code,
+          then return the URL from pyexec_get_download_url("chart.png").
+        - "Export the results as csv" -> write the file, then link it.
+        - Don't use when: the content is small text you want to read anyway --
+          pyexec_read_file puts it where you can reason about it.
+
+    Raises:
+        ValueError: if the path is outside the workspace, is not a file, or the
+            server has no address to build a link from.
+    """
+    current = settings()
+    if not current.base_url:
+        raise ValueError(
+            "This server has no address to build a download link from. Set "
+            "PYEXEC_BASE_URL to the address clients use to reach it, e.g. "
+            "http://192.168.1.10:8000, and restart."
+        )
+
+    try:
+        target = resolve_within(path, current.workspace)
+    except GuardrailError as exc:
+        raise ValueError(str(exc)) from exc
+
+    if not target.is_file():
+        raise ValueError(
+            f"No such file: {target}. Use pyexec_list_files to see what is in "
+            "the workspace."
+        )
+
+    relative = workspace_relative(target, current.workspace)
+    url, expires = build_url(
+        current.base_url,
+        relative,
+        current.auth_token,
+        current.clamp_download_ttl(ttl_seconds),
+    )
+    expires_in = max(0, int(expires - time.time()))
+
+    if current.auth_token is None:
+        note = (
+            "This server has no PYEXEC_AUTH_TOKEN, so the link is unsigned. "
+            "That is only possible on a loopback bind, which means the link "
+            "works on this machine and nowhere else."
+        )
+    else:
+        note = (
+            "Anyone holding this URL can download the file until it expires, "
+            "so share it only with the person who asked for it."
+        )
+
+    return DownloadLink(
+        url=url,
+        path=relative,
+        filename=target.name,
+        size_bytes=target.stat().st_size,
+        expires_at=datetime.fromtimestamp(expires, timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        expires_in_seconds=expires_in,
+        note=note,
+    )
+
+
+# --------------------------------------------------------------------------
 # Dependency tools
 # --------------------------------------------------------------------------
 
@@ -863,6 +988,8 @@ def config_resource() -> str:
                 else None
             ),
             "inherit_env": current.inherit_env,
+            "base_url": current.base_url,
+            "download_ttl": current.download_ttl,
             "session_alive": session().alive,
         },
         indent=2,
@@ -953,6 +1080,18 @@ def run_http(host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
             host,
             port,
         )
+
+    # Wrapped outermost, so the download route sits outside the bearer gate and
+    # answers for itself with signatures in the URL. Without a token there is
+    # nothing to sign with and the route asks for nothing -- safe precisely
+    # because the interlock above confined such a server to loopback.
+    app = DownloadRouter(app, current)
+    log.info(
+        "File downloads served at %s%s, links valid for %gs",
+        current.base_url,
+        DOWNLOAD_PREFIX,
+        current.download_ttl,
+    )
 
     uvicorn.run(app, host=host, port=port)
 
