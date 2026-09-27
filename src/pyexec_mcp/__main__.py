@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--host",
-        default=os.environ.get("PYEXEC_HOST", "127.0.0.1"),
+        default=os.environ.get("PYEXEC_HOST", "0.0.0.0"),
         help="Bind address for the streamable-http transport.",
     )
     parser.add_argument(
