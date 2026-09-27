@@ -1,0 +1,9 @@
+.venv/
+.venv-probe/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.pyexec-workspace/
