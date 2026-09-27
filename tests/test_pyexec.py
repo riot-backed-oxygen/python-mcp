@@ -13,30 +13,7 @@ import time
 import pytest
 
 from pyexec_mcp import server
-from pyexec_mcp.config import Settings
 from pyexec_mcp.sandbox import GuardrailError, check_code, check_package_specs
-
-
-def make_settings(workspace, **overrides) -> Settings:
-    base = dict(
-        workspace=workspace,
-        python_executable=sys.executable,
-        default_timeout=15.0,
-        max_timeout=60.0,
-        max_output_chars=20_000,
-        allowed_modules=None,
-        inherit_env=True,
-    )
-    base.update(overrides)
-    return Settings(**base)
-
-
-@pytest.fixture
-def workspace(tmp_path):
-    """Point the server at a throwaway workspace and tear the session down."""
-    server.use_settings(make_settings(tmp_path))
-    yield tmp_path
-    server.use_settings(make_settings(tmp_path))  # closes the session
 
 
 # --------------------------------------------------------------------------
@@ -174,7 +151,9 @@ def test_session_is_usable_after_a_timeout(workspace):
     assert server.pyexec_run("6 * 7").result == "42"
 
 
-def test_timeout_argument_is_clamped_to_the_configured_maximum(workspace):
+def test_timeout_argument_is_clamped_to_the_configured_maximum(
+    workspace, make_settings
+):
     server.use_settings(make_settings(workspace, default_timeout=5.0, max_timeout=2.0))
     result = server.pyexec_run("while True:\n    pass", timeout=9999)
 
@@ -213,7 +192,7 @@ def test_session_info_is_safe_before_any_call(workspace):
 # Guardrails
 # --------------------------------------------------------------------------
 
-def test_import_allowlist_blocks_other_modules(workspace):
+def test_import_allowlist_blocks_other_modules(workspace, make_settings):
     server.use_settings(make_settings(workspace, allowed_modules=frozenset({"math"})))
     result = server.pyexec_run("import os")
 
@@ -222,12 +201,12 @@ def test_import_allowlist_blocks_other_modules(workspace):
     assert "os" in result.error.message
 
 
-def test_import_allowlist_permits_listed_modules(workspace):
+def test_import_allowlist_permits_listed_modules(workspace, make_settings):
     server.use_settings(make_settings(workspace, allowed_modules=frozenset({"math"})))
     assert server.pyexec_run("import math\nmath.floor(1.5)").result == "1"
 
 
-def test_allowlist_catches_dunder_import(workspace):
+def test_allowlist_catches_dunder_import(workspace, make_settings):
     server.use_settings(make_settings(workspace, allowed_modules=frozenset({"math"})))
     result = server.pyexec_run("__import__('subprocess')")
 

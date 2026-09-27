@@ -21,6 +21,8 @@ ENV_KEYS = {
     "max_timeout": "PYEXEC_MAX_TIMEOUT",
     "max_output_chars": "PYEXEC_MAX_OUTPUT_CHARS",
     "allowed_modules": "PYEXEC_ALLOWED_MODULES",
+    "auth_token": "PYEXEC_AUTH_TOKEN",
+    "auth_token_file": "PYEXEC_AUTH_TOKEN_FILE",
 }
 
 
@@ -75,6 +77,22 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--auth-token",
+        help=(
+            "Shared secret HTTP clients must send as 'Authorization: Bearer'. "
+            "Required when --host is not loopback. Prefer the "
+            "PYEXEC_AUTH_TOKEN environment variable, or --auth-token-file, so "
+            "the secret stays out of the process listing."
+        ),
+    )
+    parser.add_argument(
+        "--auth-token-file",
+        help=(
+            "Read the bearer token from this file instead of the command line. "
+            "Trailing whitespace is stripped."
+        ),
+    )
+    parser.add_argument(
         "--no-inherit-env",
         action="store_true",
         help="Run workers with a scrubbed environment instead of the server's.",
@@ -83,6 +101,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before build_parser(), because several flag defaults come from the
+    # environment -- PYEXEC_TRANSPORT, PYEXEC_HOST and PYEXEC_PORT among them.
+    # server.main() loads it too; a second pass is a no-op.
+    from . import dotenv
+
+    dotenv.load(os.environ.get("PYEXEC_ENV_FILE", dotenv.DEFAULT_ENV_FILENAME))
+
     args = build_parser().parse_args(argv)
 
     for flag, env_key in ENV_KEYS.items():
@@ -93,10 +118,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.no_inherit_env:
         os.environ["PYEXEC_INHERIT_ENV"] = "0"
 
-    if args.transport == "stdio":
-        server.main(transport="stdio")
-    else:
-        server.main(transport="streamable-http", host=args.host, port=args.port)
+    server.main(
+        transport=args.transport,
+        host=args.host,
+        port=args.port,
+    )
     return 0
 
 

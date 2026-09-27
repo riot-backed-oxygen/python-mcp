@@ -11,6 +11,8 @@ Tools and resources are declared here; execution lives in
 from __future__ import annotations
 
 import atexit
+import os
+import sys
 import threading
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -20,7 +22,8 @@ from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
 from . import packages
-from .config import Settings
+from .auth import BearerTokenMiddleware
+from .config import Settings, is_loopback
 from .sandbox import GuardrailError, check_code, resolve_within
 from .session import ExecutionSession, run_isolated
 
@@ -866,9 +869,130 @@ def config_resource() -> str:
     )
 
 
-def main(transport: Literal["stdio", "streamable-http"] = "stdio", **kwargs: Any) -> None:
-    """Run the server. Kept here so the tools and the entry point stay together."""
-    mcp.run(transport=transport, **kwargs)
+# --------------------------------------------------------------------------
+# Transports
+# --------------------------------------------------------------------------
+
+def _unauthenticated_binding_message(host: str, port: int) -> str:
+    return (
+        f"Refusing to bind {host}:{port} without authentication.\n"
+        "\n"
+        "This server executes arbitrary Python. On a non-loopback address,\n"
+        "anyone who can reach the port can run code on this machine as you.\n"
+        "\n"
+        "Either set a token:\n"
+        '  python -c "import secrets; print(secrets.token_urlsafe(32))"\n'
+        "  export PYEXEC_AUTH_TOKEN=<that value>\n"
+        "or put PYEXEC_AUTH_TOKEN=<that value> in a .env file next to where\n"
+        "you start the server (see also PYEXEC_ENV_FILE),\n"
+        "\n"
+        "or bind the loopback address instead:\n"
+        "  pyexec-mcp --transport streamable-http --host 127.0.0.1"
+    )
 
 
-__all__ = ["mcp", "main", "settings", "session", "use_settings"]
+def _configure_logging() -> None:
+    """Send logs to stderr.
+
+    Not cosmetic: on the stdio transport, stdout is the protocol channel, so a
+    stray log line there would corrupt the session.
+    """
+    import logging
+
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
+def _resolve_settings_or_exit() -> Settings:
+    """Read the environment, reporting a bad value without a stack trace.
+
+    A mistyped token is a configuration mistake, not a bug, and the message
+    already says what to do -- burying it under twenty frames of traceback
+    only makes the reader hunt for the one line that matters.
+    """
+    try:
+        return settings()
+    except ValueError as exc:
+        raise SystemExit(f"pyexec-mcp: {exc}") from None
+
+
+def run_http(host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
+    """Serve the streamable-http transport.
+
+    Authentication is enforced whenever ``PYEXEC_AUTH_TOKEN`` is set, and
+    binding a non-loopback address without one is refused outright rather than
+    warned about -- an accidentally exposed code-execution endpoint is not
+    something to discover later from a log line.
+
+    Raises:
+        SystemExit: if ``host`` is not loopback and no token is configured.
+    """
+    import logging
+
+    import uvicorn
+
+    _configure_logging()
+    log = logging.getLogger("pyexec_mcp.transport")
+    current = settings()
+
+    if current.auth_token is None and not is_loopback(host):
+        raise SystemExit(_unauthenticated_binding_message(host, port))
+
+    app = mcp.streamable_http_app(host=host, **kwargs)
+
+    if current.auth_token is not None:
+        app.add_middleware(BearerTokenMiddleware, token=current.auth_token)
+        log.info("Bearer-token authentication enabled for %s:%s", host, port)
+    else:
+        log.warning(
+            "No PYEXEC_AUTH_TOKEN set; any local process that can reach %s:%s "
+            "can execute code. Allowed only because that address is loopback.",
+            host,
+            port,
+        )
+
+    uvicorn.run(app, host=host, port=port)
+
+
+def _load_env_file() -> None:
+    """Merge a ``.env`` into the environment before settings are read.
+
+    Runs at the top of :func:`main` because ``Settings`` is built from the
+    environment and cached on first use -- load any later and the server would
+    already have decided it has no token.
+    """
+    import logging
+
+    from . import dotenv
+
+    path = os.environ.get("PYEXEC_ENV_FILE", dotenv.DEFAULT_ENV_FILENAME)
+    applied = dotenv.load(path)
+    if applied:
+        # Names only. A token must never reach the log.
+        logging.getLogger("pyexec_mcp.config").info(
+            "Loaded %s from %s", ", ".join(sorted(applied)), path
+        )
+
+
+def main(
+    transport: Literal["stdio", "streamable-http"] = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    **kwargs: Any,
+) -> None:
+    """Run the server on the requested transport."""
+    _configure_logging()
+    _load_env_file()
+    # Resolved up front so a bad setting is reported once, cleanly, instead of
+    # surfacing from whichever code path happens to touch it first.
+    _resolve_settings_or_exit()
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        run_http(host=host, port=port, **kwargs)
+
+
+__all__ = ["mcp", "main", "run_http", "settings", "session", "use_settings"]

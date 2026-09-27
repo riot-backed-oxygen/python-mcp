@@ -5,13 +5,13 @@ description = "MCP server that runs Python code in a persistent session or in is
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["mcp>=2.2.0"]
+dependencies = ["mcp>=2.2.0", "uvicorn>=0.30"]
 
 [project.scripts]
 pyexec-mcp = "pyexec_mcp.__main__:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "pytest-asyncio>=0.24"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.24", "httpx>=0.27"]
 
 [build-system]
 requires = ["hatchling"]

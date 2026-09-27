@@ -44,6 +44,8 @@ uv pip install -e ".[dev]"
 .venv/Scripts/python.exe -m pyexec_mcp --transport streamable-http --port 8000
 ```
 
+注意 `--host` 的默认值是 `0.0.0.0`（监听所有网卡），而这是一个**能执行任意代码**的端点。所以有个联锁：非 loopback 地址上没配令牌就拒绝启动，见下面的「鉴权」。
+
 ## 接到 Claude Code
 
 ```bash
@@ -109,12 +111,82 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `PYEXEC_MAX_OUTPUT_CHARS` | `40000` | 每个输出流保留的字符数，超出截断 |
 | `PYEXEC_ALLOWED_MODULES` | 未设置 | 允许 import 的顶层模块白名单，逗号分隔 |
 | `PYEXEC_INHERIT_ENV` | `1` | 是否让 worker 继承服务器环境变量 |
+| `PYEXEC_ENV_FILE` | `.env` | 启动时合并这个文件里的变量 |
+| `PYEXEC_AUTH_TOKEN` | 未设置 | streamable-http 的 Bearer 令牌，至少 16 字符 |
+| `PYEXEC_AUTH_TOKEN_FILE` | 未设置 | 从文件读令牌；`PYEXEC_AUTH_TOKEN` 优先 |
+
+### 用 `.env` 配
+
+Python 不会自己读 `.env`，所以启动时 server 会主动合并工作目录下的 `.env`（或者 `PYEXEC_ENV_FILE` 指向的文件）：
+
+```bash
+# .env
+PYEXEC_AUTH_TOKEN=<python -c "import secrets; print(secrets.token_urlsafe(32))">
+PYEXEC_WORKSPACE=D:/develop/vibecoding/python-mcp
+PYEXEC_TIMEOUT=30
+```
+
+支持 `#` 注释、空行、可选的 `export ` 前缀、单/双引号包裹、双引号内的反斜杠转义，以及不带引号时行尾的注释（` #` 起头）。UTF-8 BOM 会被去掉（记事本存出来的文件能用）。
+
+几条刻意的规则：
+
+- **真实环境变量永远赢**。已经 `export` 的值不会被 `.env` 覆盖，命令行 flag 又覆盖环境变量。优先级是 `flag > export > .env`，所以不会出现"明明 export 了却读到文件里旧值"这种事。
+- **`.env` 读不到就静默跳过**，不算错误——没这个文件是完全正常的。但 `PYEXEC_ENV_FILE` 指向一个存在却读不了的文件会明确报错。
+
+- **加载发生在解析 flag 之前**，所以 `.env` 里的 `PYEXEC_HOST`/`PYEXEC_PORT`/`PYEXEC_TRANSPORT` 能当默认值用。
+- 日志只会打印**加载了哪些变量名**，不打印值——令牌不会进日志。
+
 
 `PYEXEC_ALLOWED_MODULES` 值得单独说一句：不设置时完全不限制 import；一旦设置，就只有白名单内的模块能被导入，检查在建进程之前用 AST 完成：
 
 ```bash
 PYEXEC_ALLOWED_MODULES=math,json,statistics
 ```
+
+---
+
+## 鉴权（只对 streamable-http 生效）
+
+stdio 不需要鉴权——它的访问控制就是"能启动这个进程"。streamable-http 监听端口，必须自己把关。
+
+**用法**：配一个至少 16 字符的共享密钥，客户端在 `Authorization` 头里带上它。
+
+```bash
+# 环境变量（推荐，密钥不进进程列表）
+export PYEXEC_AUTH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe(32))")
+.venv/Scripts/python.exe -m pyexec_mcp --transport streamable-http --host 0.0.0.0 --port 8000
+
+# 或者从文件读
+.venv/Scripts/python.exe -m pyexec_mcp --transport streamable-http --auth-token-file ./token.txt
+```
+
+也可以直接写进 `.env`（见上面「用 `.env` 配」），server 启动时会自动加载。
+
+客户端配置：
+
+```json
+{
+  "mcpServers": {
+    "pyexec": {
+      "type": "http",
+      "url": "http://192.168.1.10:8000/mcp",
+      "headers": { "Authorization": "Bearer <你的令牌>" }
+    }
+  }
+}
+```
+
+**启动联锁**：`--host` 不是 loopback（`127.0.0.1`/`::1`/`localhost`）而 `PYEXEC_AUTH_TOKEN` 又没配，进程直接退出并说明原因。这是故意的——`--host` 的默认值就是 `0.0.0.0`，而这个端点能执行任意代码，不能因为忘了配就裸奔到局域网上。想无鉴权只在本地用，就 `--host 127.0.0.1`。
+
+**实现上的几个选择**：
+
+- **不用 SDK 的 `TokenVerifier` + `AuthSettings`**。那套是 OAuth 形状的，`AuthSettings` 强制要求 `issuer_url`；对一个自签的静态密钥来说，那等于编造一个发现端点让客户端去访问，只会更绕。这里用的是纯 ASGI 中间件（`auth.py`），没有额外依赖。
+- **令牌只从 `Authorization` 头读，不认 query string**。URL 里的密钥会漏进 access log、`Referer`、浏览器历史。
+- **比较用 `hmac.compare_digest`**，常数时间，不给时序侧信道。
+- **401 区分两种情况**：没带头返回 `error="invalid_request"`，带了但不匹配返回 `error="invalid_token"`，客户端能分清是"忘了配"还是"配错了"。
+- **非 HTTP scope（比如 lifespan）直接放行**，否则启动握手自己就被拦了。
+
+令牌泄露等于对方能在这台机器上以 server 进程的权限执行任意代码，跟直接交出 shell 是一回事——别再拿去当 API key 到处贴。
 
 ---
 
@@ -130,6 +202,7 @@ PYEXEC_ALLOWED_MODULES=math,json,statistics
 - **包名校验**：`pyexec_install_package` 拒绝形如 `--target` 的参数，避免被当成 pip flag
 - **输出截断**：防止一段死循环 print 撑爆上下文
 - **`PYEXEC_INHERIT_ENV=0`**：worker 只拿到 `PATH`/`TEMP` 等启动所需变量，API key 之类的凭据不外泄
+- **Bearer 鉴权 + 启动联锁**：streamable-http 在非 loopback 地址上没配令牌就拒绝启动
 
 真要隔离，请用容器、虚拟机或受限用户账户——把整个 server 关在里面，而不是指望这一层。
 
@@ -143,6 +216,9 @@ MCP client
     ▼
 server.py          MCPServer + 10 个工具，把 Settings 和 Session 串起来
     │
+    ├── auth.py       streamable-http 的 Bearer 中间件 + 启动联锁
+    ├── config.py     Settings：环境变量 → 配置，含令牌校验
+    ├── dotenv.py     极简 .env 读取（不引 python-dotenv）
     ├── sandbox.py     AST import 白名单、路径囚笼（进 worker 之前）
     ├── packages.py    pip 安装 / 列举
     │

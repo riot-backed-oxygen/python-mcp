@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 from mcp import ClientSession
@@ -33,6 +34,10 @@ EXPECTED_TOOLS = {
 def server_params(workspace) -> StdioServerParameters:
     env = dict(os.environ)
     env["PYEXEC_WORKSPACE"] = str(workspace)
+    # The subprocess inherits this test runner's cwd, so without this it would
+    # also pick up whatever .env the developer happens to have sitting there.
+    # Tests must fail for their own reasons, not the machine's.
+    env["PYEXEC_ENV_FILE"] = str(Path(workspace) / "no-such.env")
     return StdioServerParameters(
         command=sys.executable,
         args=["-m", "pyexec_mcp", "--workspace", str(workspace)],
@@ -149,6 +154,7 @@ async def test_guardrail_rejection_is_reported_cleanly(tmp_path):
     env = dict(os.environ)
     env["PYEXEC_WORKSPACE"] = str(tmp_path)
     env["PYEXEC_ALLOWED_MODULES"] = "math"
+    env["PYEXEC_ENV_FILE"] = str(tmp_path / "no-such.env")
     params = StdioServerParameters(
         command=sys.executable,
         args=["-m", "pyexec_mcp"],

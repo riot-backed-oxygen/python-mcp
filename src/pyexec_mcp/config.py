@@ -25,6 +25,14 @@ DEFAULT_MAX_OUTPUT_CHARS = 40_000
 #: before it gives up waiting and kills the process outright.
 TIMEOUT_GRACE = 5.0
 
+#: Shortest bearer token accepted for the streamable-http transport. A guessable
+#: token on a code-execution server is worse than no token at all, because it
+#: looks like protection.
+MIN_TOKEN_LENGTH = 16
+
+#: Hosts that are reachable only from this machine.
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
 
 def _env_str(name: str, default: str | None = None) -> str | None:
     value = os.environ.get(name)
@@ -46,6 +54,49 @@ def _env_bool(name: str, default: bool) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def is_loopback(host: str) -> bool:
+    """Whether *host* is reachable only from this machine."""
+    return host.strip().lower() in LOOPBACK_HOSTS
+
+
+def _resolve_auth_token() -> str | None:
+    """Read the HTTP bearer token, preferring the direct variable over a file.
+
+    A file is offered because an environment variable shows up in ``ps`` output
+    and in crash dumps, which is a poor place for a secret that guards code
+    execution.
+
+    Raises:
+        ValueError: if a token is configured but is too short to be worth
+            anything.
+    """
+    token = _env_str("PYEXEC_AUTH_TOKEN")
+
+    if token is None:
+        path = _env_str("PYEXEC_AUTH_TOKEN_FILE")
+        if path:
+            try:
+                token = Path(path).expanduser().read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ValueError(
+                    f"PYEXEC_AUTH_TOKEN_FILE points at {path!r}, which could not "
+                    f"be read: {exc}"
+                ) from exc
+
+    if token is None:
+        return None
+
+    if len(token) < MIN_TOKEN_LENGTH:
+        raise ValueError(
+            f"The configured auth token is only {len(token)} characters; at "
+            f"least {MIN_TOKEN_LENGTH} are required. A short token on a server "
+            "that executes arbitrary code is worse than none, because it looks "
+            "like protection. Generate one with:\n"
+            '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        )
+    return token
 
 
 @dataclass(frozen=True)
@@ -72,6 +123,10 @@ class Settings:
     #: secrets) or run against a scrubbed one.
     inherit_env: bool
 
+    #: Shared secret required from HTTP clients as ``Authorization: Bearer``.
+    #: ``None`` disables authentication, which is only permitted on loopback.
+    auth_token: str | None = None
+
     @classmethod
     def from_env(cls) -> "Settings":
         workspace = Path(
@@ -95,6 +150,7 @@ class Settings:
             ),
             allowed_modules=allowed_modules,
             inherit_env=_env_bool("PYEXEC_INHERIT_ENV", True),
+            auth_token=_resolve_auth_token(),
         )
 
     def clamp_timeout(self, timeout: float | None) -> float:
