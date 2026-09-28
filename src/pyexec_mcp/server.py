@@ -33,6 +33,7 @@ from .downloads import DOWNLOAD_PREFIX, DownloadRouter, build_url, workspace_rel
 from .jobs import JobLimitReached, JobManager
 from .sandbox import GuardrailError, check_code, resolve_within
 from .session import ExecutionSession, SessionError, run_isolated
+from .web import WebRouter
 
 SERVER_NAME = "pyexec_mcp"
 
@@ -2091,6 +2092,7 @@ def run_http(host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
     # nothing to sign with and the route asks for nothing -- safe precisely
     # because the interlock above confined such a server to loopback.
     app = DownloadRouter(app, current)
+    app = WebRouter(app, current)
     log.info(
         "File downloads served at %s%s, links valid for %gs",
         current.base_url,

@@ -1,0 +1,87 @@
+:root{--bg:#111715;--surface:#1b2521;--surface-2:#202c27;--line:#3a4941;--muted:#91a198;--text:#ecf1e8;--accent:#d9f675;--danger:#ffad98}*{box-sizing:border-box}html{min-height:100%;background:var(--bg)}body{margin:0;color:var(--text);font:15px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;background:radial-gradient(ellipse 45% 48% at 10% 55%,#20352b 0%,transparent 75%),var(--bg);min-height:100vh}body:before{content:"";position:fixed;inset:0;pointer-events:none;opacity:.18;background-image:linear-gradient(#ffffff08 1px,transparent 1px),linear-gradient(90deg,#ffffff08 1px,transparent 1px);background-size:46px 46px}.shell{max-width:1440px;min-height:100vh;margin:auto;padding:30px clamp(24px,5vw,76px) 22px;display:flex;flex-direction:column;position:relative}.masthead,footer{display:flex;align-items:center;justify-content:space-between}.masthead{padding-bottom:28px;border-bottom:1px solid var(--line)}.brand{text-decoration:none;color:var(--text);font:700 18px/1.2 Consolas,"Courier New",monospace;letter-spacing:-.04em;display:flex;align-items:center;gap:14px}.brand-mark{display:grid;place-items:center;width:37px;height:37px;color:var(--bg);background:var(--accent);font-size:15px;letter-spacing:-.13em}.brand-muted{color:var(--muted);font-weight:400}.header-right,footer,.eyebrow,.small-label,.panel-top,.panel-bottom,.heading-index{font:11px/1.3 Consolas,"Courier New",monospace;letter-spacing:.11em}.header-right{display:flex;align-items:center;gap:13px;color:var(--muted)}.status-dot{width:7px;height:7px;border-radius:50%;background:var(--muted);box-shadow:0 0 0 4px #91a1981a}.status-dot.online{background:var(--accent);box-shadow:0 0 0 4px #d9f67521}.header-rule{height:16px;width:1px;background:var(--line);margin:0 5px}main{flex:1;display:grid;grid-template-columns:minmax(0,1fr) minmax(380px,490px);align-items:center;gap:clamp(45px,7vw,125px);padding:70px 0 80px}.intro{align-self:center}.eyebrow{display:flex;align-items:center;gap:14px;color:var(--accent);margin-bottom:25px}.eyebrow-line{width:28px;height:1px;background:var(--accent)}h1{font-family:Georgia,"Noto Serif CJK SC","SimSun",serif;font-weight:400;line-height:1.1;letter-spacing:-.055em;font-size:clamp(58px,6.5vw,104px);margin:0 0 32px}h1 em{font-style:normal;color:var(--accent)}.intro p{max-width:410px;color:#a9b6ae;font-size:16px;line-height:1.9;margin:0}.panel{background:linear-gradient(145deg,#202d27,#19231f);border:1px solid #526153;box-shadow:0 35px 80px #050b0780,0 0 0 9px #d9f67506;position:relative}.panel:before{content:"";position:absolute;width:13px;height:13px;top:-1px;left:-1px;border-top:2px solid var(--accent);border-left:2px solid var(--accent)}.panel-top,.panel-bottom{display:flex;justify-content:space-between;color:var(--muted);padding:17px 29px}.panel-top{border-bottom:1px solid var(--line)}.panel-symbol{color:var(--accent);font-size:18px;line-height:12px}.panel-bottom{border-top:1px solid var(--line);font-size:10px}.view{padding:42px 39px 34px}.hidden{display:none!important}.section-heading{display:flex;justify-content:space-between;align-items:end;gap:15px}.small-label{color:var(--accent)}h2{font-family:Georgia,"Noto Serif CJK SC","SimSun",serif;font-size:32px;font-weight:400;letter-spacing:-.04em;line-height:1.2;margin:10px 0 0}.heading-index{font-size:35px;color:#7b8d7f;line-height:1}.panel-copy{font-size:14px;color:#a7b5a9;margin:23px 0 32px;line-height:1.8}.panel-copy code{font:13px Consolas,"Courier New",monospace;color:#e5edcf}label{display:block;color:#cfdacf;font-size:12px;letter-spacing:.03em;margin-bottom:10px}.input-wrap{display:flex;align-items:center;border:1px solid #58675b;background:#101a15;height:51px;transition:border-color .2s,box-shadow .2s}.input-wrap:focus-within{border-color:var(--accent);box-shadow:0 0 0 3px #d9f67520}.input-icon{width:45px;text-align:center;color:var(--accent);font:20px Consolas,monospace}.input-wrap input{min-width:0;flex:1;background:transparent;border:0;outline:0;color:var(--text);font:14px "Segoe UI","Microsoft YaHei",sans-serif}.input-wrap input::placeholder{color:#75867a}.icon-button,.text-button{background:none;border:0;cursor:pointer;color:var(--accent);font:12px "Segoe UI","Microsoft YaHei",sans-serif}.icon-button{margin-right:14px}.text-button{white-space:nowrap}.icon-button:hover,.text-button:hover{text-decoration:underline}.primary-button{width:100%;display:flex;justify-content:space-between;align-items:center;height:52px;background:var(--accent);color:#142016;border:1px solid var(--accent);font-weight:700;font-size:14px;cursor:pointer;padding:0 20px;margin-top:24px;transition:background .2s,transform .2s,box-shadow .2s}.primary-button:hover:not(:disabled){background:#eaff9e;transform:translateY(-2px);box-shadow:0 8px 23px #d9f67524}.primary-button:disabled{opacity:.45;cursor:not-allowed}.primary-button span:last-child{font-size:20px;font-weight:400}.message{font-size:13px;min-height:20px;margin:14px 0 0;color:var(--muted)}.message.error{color:var(--danger)}.message.success{color:var(--accent)}.drop-zone{background:#152019;border:1px dashed #73836d;text-align:center;min-height:179px;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer;transition:background .2s,border-color .2s;gap:2px}.drop-zone:hover,.drop-zone.dragging,.drop-zone:focus-visible{background:#25372a;border-color:var(--accent);outline:none}.drop-icon{font:39px/1 Consolas,monospace;color:var(--accent);margin-bottom:12px}.drop-zone strong{font-size:15px;font-weight:600}.drop-zone>span{color:var(--muted);font-size:12px}.select-link{color:var(--accent);text-decoration:underline;text-underline-offset:3px}.field-row{display:flex;align-items:end;gap:16px;margin-top:24px}.field{flex:1;min-width:0}.field .input-wrap{height:46px}.optional{color:var(--muted)}.check-line{display:flex;align-items:center;gap:8px;white-space:nowrap;margin:0 0 12px;cursor:pointer;font-size:12px}.check-line input{accent-color:var(--accent)}.queue{margin-top:20px;border-top:1px solid var(--line);max-height:200px;overflow-y:auto}.queue-item{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);font-size:12px;padding:9px 1px}.queue-item .file-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.queue-item .file-state{color:var(--muted);white-space:nowrap}.queue-item.done .file-state{color:var(--accent)}.queue-item.failed .file-state{color:var(--danger)}.browser-head{display:flex;justify-content:space-between;align-items:end;gap:10px;border-top:1px solid var(--line);padding-top:27px;margin-top:27px}.browser-head h3{font-family:Georgia,"Noto Serif CJK SC","SimSun",serif;font-size:25px;font-weight:400;margin:7px 0 0}.browser-path{display:flex;align-items:center;gap:12px;margin-top:19px;padding:8px 10px;background:#121d16;border:1px solid var(--line);font:12px Consolas,"Courier New",monospace;color:#b8c9b7;min-width:0}.browser-path button{background:transparent;color:var(--accent);border:0;cursor:pointer;font-size:18px;line-height:1}.browser-path button:disabled{opacity:.3;cursor:not-allowed}.browser-path span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-list{max-height:290px;overflow:auto;margin-top:9px;border-top:1px solid var(--line)}.file-row{display:flex;align-items:center;gap:10px;min-height:45px;border-bottom:1px solid var(--line);font-size:12px}.file-row .file-kind{width:26px;flex:none;color:var(--accent);font:15px Consolas,monospace}.file-row .file-title{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.file-row .file-size{color:var(--muted);white-space:nowrap;font:11px Consolas,monospace}.file-row button{border:0;background:transparent;color:var(--accent);cursor:pointer;font:12px "Segoe UI","Microsoft YaHei",sans-serif;padding:6px 0 6px 9px}.file-row button:hover{text-decoration:underline}.empty-list{color:var(--muted);font-size:12px;padding:25px 0;text-align:center}footer{border-top:1px solid var(--line);padding-top:18px;color:#708277}footer span:nth-child(2){color:var(--accent)}@media(max-width:900px){main{grid-template-columns:1fr;gap:52px;padding:70px 0}.intro p{max-width:600px}.panel{max-width:600px;width:100%}}@media(max-width:560px){.shell{padding:20px 18px}.masthead{padding-bottom:20px}.header-right{font-size:10px}.header-right span:nth-child(2),.header-rule{display:none}main{padding:58px 0;gap:42px}h1{font-size:clamp(52px,12vw,72px);margin-bottom:18px}.intro p{font-size:14px}.view{padding:31px 22px}.panel-top,.panel-bottom{padding-left:22px;padding-right:22px}.field-row{flex-direction:column;align-items:stretch}.check-line{margin:0}footer span:nth-child(2){display:none}}@media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+
+/* The file browser is the primary surface; the transfer controls sit alongside it. */
+main{display:block;padding:42px 0 66px}
+.intro{margin-bottom:26px}
+.eyebrow{margin-bottom:11px}
+.intro-row{display:flex;align-items:end;justify-content:space-between;gap:28px}
+.intro h1{font-size:clamp(34px,3.6vw,52px);line-height:1.12;margin:0;letter-spacing:-.04em;white-space:nowrap}
+.intro p{max-width:none;margin:0 0 4px;text-align:right;font-size:13px;line-height:1.7}
+.panel{width:100%}
+#login-view{max-width:560px;margin:auto}
+#upload-view{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(370px,.85fr);padding:0}
+.workspace-browser,.workspace-transfer{min-width:0;padding:32px clamp(25px,3vw,44px) 26px}
+.workspace-transfer{border-left:1px solid var(--line);background:#1b2720}
+.browser-head{border:0;padding:0;margin:0;align-items:end}
+.browser-head h2{margin-top:9px}
+.browser-path{margin-top:25px}
+.file-list{max-height:min(62vh,650px);min-height:350px}
+.file-row{min-height:51px}
+.workspace-transfer .panel-copy{margin:17px 0 25px}
+.workspace-transfer .drop-zone{min-height:168px}
+.workspace-transfer .field-row{margin-top:22px}
+@media(max-width:1000px){
+  main{padding:38px 0 58px}
+  .panel{max-width:none}
+  #upload-view{grid-template-columns:1fr}
+  .workspace-transfer{border-left:0;border-top:1px solid var(--line)}
+  .file-list{min-height:250px;max-height:400px}
+}
+@media(max-width:650px){
+  main{padding:36px 0 46px}
+  .intro-row{display:block}
+  .intro h1{font-size:38px}
+  .intro p{text-align:left;margin-top:10px}
+  .workspace-browser,.workspace-transfer{padding:27px 22px 20px}
+  .file-list{min-height:220px;max-height:330px}
+}
+
+/* Compact uploads and the file inspector. */
+.browser-actions{display:flex;align-items:center;gap:17px;flex-wrap:wrap;justify-content:flex-end}
+.compact-button{background:var(--accent);border:1px solid var(--accent);color:#142016;font:700 12px "Segoe UI","Microsoft YaHei",sans-serif;cursor:pointer;white-space:nowrap;padding:10px 14px;transition:background .2s,transform .2s}
+.compact-button:hover:not(:disabled){background:#eaff9e;transform:translateY(-1px)}
+.compact-button:disabled{opacity:.5;cursor:not-allowed}
+.workspace-inspector{min-width:0;min-height:560px;padding:32px clamp(25px,3vw,44px) 26px;border-left:1px solid var(--line);background:#1b2720}
+.workspace-inspector .section-heading h2{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:260px}
+.dialog-meta{display:flex;justify-content:space-between;align-items:center;gap:14px;border-bottom:1px solid var(--line);margin:22px 0 16px;padding-bottom:12px;color:var(--muted);font:11px Consolas,"Courier New",monospace}
+.dialog-meta span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dialog-meta span:last-child{white-space:nowrap}
+.file-content{display:block;width:100%;min-height:360px;resize:vertical;padding:17px;background:#101a15;border:1px solid #58675b;color:var(--text);font:13px/1.65 Consolas,"Courier New",monospace;outline:0}
+.file-content:focus{border-color:var(--accent)}
+.file-content[readonly]{color:#cad7c8}
+.image-preview{display:block;max-width:100%;max-height:430px;margin:auto;object-fit:contain;background:#101a15}
+.preview-note{color:var(--muted);font-size:13px;line-height:1.8;padding:35px 10px;text-align:center;background:#101a15;border:1px solid var(--line)}
+.dialog-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:18px}
+.secondary-button{background:transparent;border:1px solid #667666;color:var(--accent);font:12px "Segoe UI","Microsoft YaHei",sans-serif;padding:10px 13px;cursor:pointer}
+.secondary-button:hover{border-color:var(--accent);background:#d9f6750d}
+.file-row{display:grid;grid-template-columns:24px minmax(0,1fr) auto auto;gap:10px}
+.file-actions{display:flex;align-items:center;gap:11px}
+.file-row .file-actions button{padding:5px 0;white-space:nowrap}
+.file-row .file-actions .delete-action{color:var(--danger)}
+@media(max-width:1000px){
+  .workspace-inspector{border-left:0;border-top:1px solid var(--line);min-height:420px}
+}
+@media(max-width:650px){
+  .workspace-inspector{padding:27px 22px 22px}
+  .browser-actions{gap:9px}
+  .compact-button{padding:9px 10px}
+  .file-row{grid-template-columns:18px minmax(0,1fr) auto;gap:7px}
+  .file-row .file-size{display:none}
+  .file-actions{gap:8px}
+  .file-content{min-height:310px}
+}
+
+.header-logout{border-left:1px solid var(--line);padding-left:17px;margin-left:3px;font:11px Consolas,"Courier New",monospace;letter-spacing:.04em}
+@media(max-width:560px){
+  .brand-muted{display:none}
+  .header-right{gap:9px}
+  .header-logout{padding-left:9px;margin-left:0;font-size:10px}
+}
+
+/* Keep the browser full width until a file is opened. */
+#upload-view{grid-template-columns:minmax(0,1fr)}
+#upload-view.inspector-open{grid-template-columns:minmax(0,1.45fr) minmax(370px,.85fr)}
+.workspace-inspector .section-heading{align-items:end}
+@media(max-width:1000px){
+  #upload-view.inspector-open{grid-template-columns:1fr}
+}

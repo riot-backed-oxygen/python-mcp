@@ -217,6 +217,15 @@ export PYEXEC_AUTH_TOKEN=$(python -c "import secrets;print(secrets.token_urlsafe
 
 ## 文件下载（只对 streamable-http 生效）
 
+### 浏览器工作区
+
+启动 `streamable-http` 服务并配置 `PYEXEC_AUTH_TOKEN` 后，打开 `http://<服务地址>:<端口>/ui/`。用同一个令牌登录，即可逐级浏览 `PYEXEC_WORKSPACE` 目录。目录栏的“上传文件”按钮支持多选，文件会上传到当前目录；遇到同名文件时会询问是否覆盖。单个文件上传上限为 1 GiB。
+
+文件操作包括下载、查看和删除。点击“查看”后才会展开右侧文件区域，关闭后目录恢复完整宽度。UTF-8 文本文件（不超过 2 MiB）可在右侧查看、编辑和保存；常见图片（不超过 10 MiB）可预览，其他文件可下载查看。保存会检查文件打开后是否被其他程序改动，冲突时需要重新打开。删除会要求确认，目录只能在为空时删除。
+
+令牌保存在当前浏览器标签页的 `sessionStorage` 中，请求时只通过 `Authorization: Bearer` 请求头发送。关闭标签页或点击“退出登录”会清除它。文件列表和上传接口均要求令牌；未配置 `PYEXEC_AUTH_TOKEN` 时，Web 页面不能登录。工作区路径仍受 `resolve_within` 检查。下载按钮复用已有的 `/download/` 接口，通过 Bearer 请求头获取文件。
+
+
 代码生成的东西——图表、报表、导出的 csv——没地方去：`pyexec_read_file` 只能把内容读回模型上下文，二进制读不了，大文件还会挤爆上下文。所以配一个 HTTP 下载接口：
 
 ```
@@ -393,6 +402,8 @@ server.py          MCPServer + 17 个工具，把 Settings、Session、JobManage
     │
     ├── auth.py       streamable-http 的 Bearer 中间件 + 启动联锁
     ├── downloads.py  /download 前置门：签名链接、路径囚笼、FileResponse
+    ├── web.py        /ui 前置门：登录校验、流式上传、文件浏览/编辑/删除 API
+    ├── web_assets/   浏览器登录、文件管理页面
     ├── telegram.py   长时间运行结束后的 Telegram 通知（后台线程，失败只记日志）
     ├── jobs.py       后台任务登记表：独立进程、取消、有界历史
     ├── config.py     Settings：环境变量 → 配置，含令牌校验与 base URL 推导

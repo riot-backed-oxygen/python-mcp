@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Workspace · pyexec</title>
+  <link rel="stylesheet" href="./styles.css">
+  <script src="./app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="masthead">
+      <a class="brand" href="./" aria-label="pyexec workspace 首页"><span class="brand-mark">&gt;_</span><span>pyexec<span class="brand-muted"> / workspace</span></span></a>
+      <div class="header-right"><span class="status-dot"></span><span>FILE TRANSFER</span><span class="header-rule"></span><span id="header-status">未连接</span><button id="logout" class="text-button header-logout hidden" type="button">退出登录 ↗</button></div>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <div class="eyebrow"><span class="eyebrow-line"></span> REMOTE WORKSPACE / 01</div>
+        <div class="intro-row"><h1 id="page-title">工作区<em>文件</em></h1><p>浏览、上传、查看和编辑文件，供 pyexec 的 Python 会话使用。</p></div>
+      </section>
+
+      <section class="panel" aria-label="工作区文件管理">
+        <div class="panel-top"><span id="step-label">01 / 验证身份</span><span class="panel-symbol">↗</span></div>
+
+        <div id="login-view" class="view">
+          <div class="section-heading"><div><span class="small-label">ACCESS CONTROL</span><h2>连接到工作区</h2></div><span class="heading-index">01</span></div>
+          <p class="panel-copy">输入服务端配置的 <code>PYEXEC_AUTH_TOKEN</code>。令牌只保存在当前浏览器标签页中。</p>
+          <form id="login-form" autocomplete="off">
+            <label for="token">访问令牌</label>
+            <div class="input-wrap"><span class="input-icon">⌁</span><input id="token" name="token" type="password" placeholder="输入访问令牌" required spellcheck="false" autocomplete="off"><button id="toggle-token" class="icon-button" type="button" aria-label="显示令牌">显示</button></div>
+            <button class="primary-button" type="submit"><span>验证并进入</span><span aria-hidden="true">↗</span></button>
+          </form>
+          <p id="login-message" class="message" role="status" aria-live="polite"></p>
+        </div>
+
+        <div id="upload-view" class="view hidden">
+          <section class="workspace-browser" aria-labelledby="browser-title">
+            <div class="browser-head"><div><span class="small-label">WORKSPACE FILES</span><h2 id="browser-title">文件目录</h2></div><div class="browser-actions"><button id="refresh-files" class="text-button" type="button">刷新 ↻</button><button id="upload-button" class="compact-button" type="button">上传文件 ＋</button><input id="file-input" type="file" multiple hidden></div></div>
+            <div class="browser-path"><button id="parent-folder" type="button" aria-label="返回上级目录">←</button><span id="current-path">/</span></div>
+            <div id="file-list" class="file-list" aria-live="polite"></div>
+            <p id="files-message" class="message" role="status" aria-live="polite"></p>
+            <p id="upload-message" class="message" role="status" aria-live="polite"></p>
+          </section>
+
+          <section class="workspace-inspector hidden" aria-labelledby="file-dialog-title">
+            <div class="section-heading"><div><span class="small-label">FILE INSPECTOR</span><h2 id="file-dialog-title">查看文件</h2></div><button id="close-inspector" class="text-button" type="button" aria-label="关闭文件查看区">关闭 ✕</button></div>
+            <div id="inspector-content" class="hidden">
+              <div class="dialog-meta"><span id="file-dialog-path"></span><span id="file-dialog-size"></span></div>
+              <textarea id="file-content" class="file-content hidden" readonly spellcheck="false" aria-label="文件内容"></textarea>
+              <img id="image-preview" class="image-preview hidden" alt="文件预览">
+              <p id="preview-note" class="preview-note hidden"></p>
+              <p id="file-dialog-message" class="message" role="status" aria-live="polite"></p>
+              <div class="dialog-actions"><button id="edit-file" class="secondary-button hidden" type="button">编辑文本</button><button id="save-file" class="compact-button hidden" type="button">保存更改 ↗</button><button id="download-current" class="secondary-button" type="button">下载文件 ↓</button></div>
+            </div>
+          </section>
+        </div>
+        <div class="panel-bottom"><span>PYEXEC / WORKSPACE</span><span>SECURE TRANSFER</span></div>
+      </section>
+    </main>
+    <footer><span>HTTP / STREAMABLE</span><span>01 — 02</span><span>© PYEXEC</span></footer>
+  </div>
+</body>
+</html>
