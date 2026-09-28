@@ -219,14 +219,25 @@ class ExecutionSession:
     # -- public API --------------------------------------------------------
 
     def request(
-        self, op: str, timeout: float | None = None, **fields: Any
+        self,
+        op: str,
+        timeout: float | None = None,
+        *,
+        background: bool = False,
+        **fields: Any,
     ) -> CallResult:
         """Send one request and wait for its response.
 
         On timeout the worker is killed rather than left running, because a
         thread we cannot interrupt is still mutating the namespace.
+        Background requests use their own timeout ceiling, independently of
+        the ceiling for calls that keep the client waiting.
         """
-        deadline = self._settings.clamp_timeout(timeout)
+        deadline = (
+            self._settings.clamp_background_timeout(timeout)
+            if background
+            else self._settings.clamp_timeout(timeout)
+        )
 
         if not self._lock.acquire(timeout=LOCK_WAIT):
             return CallResult(
@@ -248,12 +259,17 @@ class ExecutionSession:
                 self._spawn()
                 restarted = True
 
-            return self._exchange(op, deadline, restarted, **fields)
+            return self._exchange(op, deadline, restarted, background, **fields)
         finally:
             self._lock.release()
 
     def _exchange(
-        self, op: str, deadline: float, restarted: bool, **fields: Any
+        self,
+        op: str,
+        deadline: float,
+        restarted: bool,
+        background: bool,
+        **fields: Any,
     ) -> CallResult:
         # Captured once: another thread may call close() or abort() while this
         # loop is parked in get(), and _terminate() clears the attribute. A
@@ -285,12 +301,12 @@ class ExecutionSession:
         while True:
             remaining = give_up_at - time.monotonic()
             if remaining <= 0:
-                return self._timeout_result(deadline, chunks, restarted)
+                return self._timeout_result(deadline, chunks, restarted, background)
 
             try:
                 kind, item = frames.get(timeout=remaining)
             except queue.Empty:
-                return self._timeout_result(deadline, chunks, restarted)
+                return self._timeout_result(deadline, chunks, restarted, background)
 
             if kind == "raw":
                 if sum(len(c) for c in chunks) < budget:
@@ -342,9 +358,26 @@ class ExecutionSession:
         )
 
     def _timeout_result(
-        self, deadline: float, chunks: list[str], restarted: bool
+        self,
+        deadline: float,
+        chunks: list[str],
+        restarted: bool,
+        background: bool,
     ) -> CallResult:
         self._terminate()
+        if background:
+            message = (
+                f"Execution exceeded {deadline:g}s and the background worker "
+                "was killed. Raise the timeout argument or "
+                "PYEXEC_BACKGROUND_MAX_TIMEOUT to allow a longer job."
+            )
+        else:
+            message = (
+                f"Execution exceeded {deadline:g}s and the worker was "
+                "killed; the session has been reset, so variables defined "
+                "before this call are gone. Raise the timeout argument, or "
+                "run the work in the background."
+            )
         return CallResult(
             ok=False,
             raw_output="".join(chunks),
@@ -352,12 +385,7 @@ class ExecutionSession:
             session_restarted=True,
             error={
                 "type": "TimeoutError",
-                "message": (
-                    f"Execution exceeded {deadline:g}s and the worker was "
-                    "killed; the session has been reset, so variables defined "
-                    "before this call are gone. Raise the timeout argument, or "
-                    "run the work in the background."
-                ),
+                "message": message,
                 "traceback": "",
             },
         )

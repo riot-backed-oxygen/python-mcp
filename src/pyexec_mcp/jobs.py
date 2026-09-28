@@ -265,7 +265,9 @@ class JobManager:
                 return _cancelled_result()
             if self._closing:
                 return _cancelled_result()
-        return session.request("exec", timeout=job.timeout, code=job.code)
+        return session.request(
+            "exec", timeout=job.timeout, background=True, code=job.code
+        )
 
     def _finish(self, job: Job, result: CallResult) -> None:
         """Record the outcome, forget the oldest jobs, announce this one."""

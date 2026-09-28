@@ -122,6 +122,53 @@ def test_a_script_on_disk_can_be_submitted(jobs_server, workspace):
     assert wait_for(lambda: server.pyexec_job_status(receipt.job_id).jobs[0].ok is True)
 
 
+def test_script_background_timeout_is_independent_of_foreground_limit(
+    make_settings, workspace
+):
+    server.use_settings(
+        make_settings(
+            workspace,
+            max_timeout=0.1,
+            background_timeout=1.5,
+            background_max_timeout=2.0,
+        )
+    )
+    (workspace / "long.py").write_text(
+        "import time\nend = time.monotonic() + 0.4\n"
+        "while time.monotonic() < end:\n    pass\nprint('completed')\n",
+        encoding="utf-8",
+    )
+
+    receipt = server.pyexec_run_script_background("long.py")
+
+    assert receipt.ok is True
+    assert wait_for(lambda: server.pyexec_job_status(receipt.job_id).jobs[0].state == "done")
+    result = server.pyexec_job_result(receipt.job_id)
+    assert result.ok is True
+    assert "completed" in result.stdout
+
+
+def test_script_background_timeout_uses_its_own_maximum(make_settings, workspace):
+    server.use_settings(
+        make_settings(
+            workspace,
+            max_timeout=0.1,
+            background_timeout=1.5,
+            background_max_timeout=0.3,
+        )
+    )
+    (workspace / "loop.py").write_text("while True:\n    pass\n", encoding="utf-8")
+
+    receipt = server.pyexec_run_script_background("loop.py", timeout=10)
+
+    assert receipt.ok is True
+    assert wait_for(lambda: server.pyexec_job_status(receipt.job_id).jobs[0].state == "done")
+    result = server.pyexec_job_result(receipt.job_id)
+    assert result.ok is False
+    assert result.error.type == "TimeoutError"
+    assert "0.3s" in result.error.message
+
+
 # --------------------------------------------------------------------------
 # Cancelling
 # --------------------------------------------------------------------------

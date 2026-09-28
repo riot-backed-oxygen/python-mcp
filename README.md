@@ -120,7 +120,7 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `PYEXEC_WORKSPACE` | 进程 cwd | 文件工具的根目录，也是 worker 的工作目录 |
 | `PYEXEC_PYTHON` | 服务器自身的解释器 | 执行代码用的解释器 |
 | `PYEXEC_TIMEOUT` | `30` | 单次调用的默认超时（秒） |
-| `PYEXEC_MAX_TIMEOUT` | `300` | 调用方传入超时的上限 |
+| `PYEXEC_MAX_TIMEOUT` | `300` | 阻塞式调用传入超时的上限；不限制后台任务 |
 | `PYEXEC_MAX_OUTPUT_CHARS` | `40000` | 每个输出流保留的字符数，超出截断 |
 | `PYEXEC_BACKGROUND_TIMEOUT` | `3600` | 后台任务没传 timeout 时用的默认超时（秒） |
 | `PYEXEC_BACKGROUND_MAX_TIMEOUT` | `86400` | 后台任务 timeout 的上限（秒） |
@@ -321,7 +321,7 @@ workstation · job-1a2b3c4d · nightly sweep
 
 ## 后台任务
 
-阻塞式工具有个硬上限：`PYEXEC_MAX_TIMEOUT` 默认 300 秒，到点 worker 被硬杀。十分钟的 sweep 用阻塞方式根本跑不完，而且调用方得干等十分钟——客户端可能先超时，人也可能在等的时候就走开了。
+阻塞式工具有个运行上限：`PYEXEC_MAX_TIMEOUT` 默认 300 秒。超时后先尝试中断代码；如果代码正阻塞在无法中断的调用中，服务端再等 5 秒便会终止 worker。这就是超时错误可能出现在 5 分 05 秒的原因。十分钟的 sweep 用阻塞方式跑不完，而且调用方得一直等待——客户端可能先超时，人也可能在等的时候就走开了。
 
 后台任务是把"等待"从这次执行里拿掉：submit 立刻返回一个 job id，代码在**自己的一次性进程**里继续跑，跑完自动发通知，之后随时能按 id 取回完整结果。
 
@@ -347,7 +347,7 @@ pyexec_job_cancel("job-1a2b3c4d")
 
 - **每个任务一个独立进程，不碰持久会话**。持久会话是个硬串行点：一次调用整个往返期间持有非重入锁，worker 同时只应答一个请求。让后台任务共用它，要么卡住前台调用，要么被前台调用卡住。所以后台任务走的是 `pyexec_run_isolated` 那条一次性进程的路，代价是**拿不到会话里的变量**——要传数据进去就写文件。
 - **submit 时就把进程拉起来**。多花一次解释器启动（约 100ms，相对一个跑几分钟的任务不算什么），换来两件事：返回后立刻 cancel 有进程可杀，不存在"取消撞上进程还没起来"的竞态；`PYEXEC_PYTHON` 配错了在 submit 当场报错，而不是只出现在一条可能没人看的通知里。
-- **超时用单独的一套旋钮**（`PYEXEC_BACKGROUND_TIMEOUT` / `PYEXEC_BACKGROUND_MAX_TIMEOUT`，默认 1 小时 / 1 天）。要突破的正是阻塞那套的 300 秒，沿用同一把旋钮等于没得配。
+- **超时用单独的一套旋钮**（`PYEXEC_BACKGROUND_TIMEOUT` / `PYEXEC_BACKGROUND_MAX_TIMEOUT`，默认 1 小时 / 1 天）。后台任务的 worker 使用这套时限，不受 `PYEXEC_MAX_TIMEOUT` 的 300 秒上限限制；超过后台时限且 worker 无法自行中断时，服务端再等 5 秒便会终止它。
 - **并发满了直接拒绝，不排队**。`PYEXEC_MAX_BACKGROUND_JOBS` 默认 4，每个任务都是整台子进程，这是限机器负载而不是限记账。第 5 个提交会返回 `ok=False` 并说明在跑几个，由调用方决定取消哪个——排队会让人以为任务迟早会跑，然后忘了它。
 - **`ok` 是三态**。还在跑的任务 `pyexec_job_status` 里 `ok` 是 `null` 而不是 `false`：`false` 会被读成"失败了"然后说出去。
 - **被拒绝的提交不会创建任务**。import 白名单没过、产物路径越界、脚本不存在、解释器起不来，都在 submit 阶段返回 `ok=False` + `reason`。让一个注定失败的任务跑起来再发一条失败通知，是双重浪费。
