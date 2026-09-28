@@ -414,7 +414,9 @@ def configured(tmp_path, make_settings):
 
 
 def test_the_tool_returns_a_link_the_router_accepts(configured, tmp_path):
-    (tmp_path / "summary.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    # Bytes, not text: write_text translates newlines on Windows, and the size
+    # assertion below is about what the link reports for a known file.
+    (tmp_path / "summary.csv").write_bytes(b"a,b\n1,2\n")
 
     link = server.pyexec_get_download_url("summary.csv")
     parts = urlsplit(link.url)
@@ -444,19 +446,19 @@ async def test_the_tool_serves_what_it_advertised(configured, tmp_path):
 
 
 def test_the_tool_refuses_a_path_outside_the_workspace(configured):
-    with pytest.raises(ValueError, match="escapes the workspace"):
+    with pytest.raises(server.ToolError, match="escapes the workspace"):
         server.pyexec_get_download_url("../outside.txt")
 
 
 def test_the_tool_refuses_a_missing_file(configured):
-    with pytest.raises(ValueError, match="No such file"):
+    with pytest.raises(server.ToolError, match="No such file"):
         server.pyexec_get_download_url("nope.txt")
 
 
 def test_the_tool_refuses_a_directory(configured, tmp_path):
     (tmp_path / "reports").mkdir()
 
-    with pytest.raises(ValueError, match="No such file"):
+    with pytest.raises(server.ToolError, match="No such file"):
         server.pyexec_get_download_url("reports")
 
 
@@ -492,7 +494,7 @@ def test_an_unsigned_server_says_so(tmp_path, make_settings):
 def test_no_base_url_is_an_actionable_error(tmp_path, make_settings):
     server.use_settings(make_settings(tmp_path, base_url=""))
     try:
-        with pytest.raises(ValueError, match="PYEXEC_BASE_URL"):
+        with pytest.raises(server.ToolError, match="PYEXEC_BASE_URL"):
             server.pyexec_get_download_url("anything.txt")
     finally:
         server.use_settings(make_settings(tmp_path))

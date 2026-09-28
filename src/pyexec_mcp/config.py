@@ -32,6 +32,27 @@ DEFAULT_MAX_OUTPUT_CHARS = 40_000
 #: link an answer just produced, short enough that a leaked one stops mattering.
 DEFAULT_DOWNLOAD_TTL = 3600.0
 
+#: How long a run must take before it earns a Telegram message. A minute is
+#: roughly where waiting becomes walking away; set 0 to hear about every run.
+DEFAULT_TELEGRAM_MIN_DURATION = 60.0
+
+#: Timeout a background job gets when its caller does not ask for one. An hour
+#: rather than the 30 seconds a blocking call defaults to, because escaping
+#: that ceiling is the entire reason background jobs exist.
+DEFAULT_BACKGROUND_TIMEOUT = 3600.0
+
+#: Ceiling for a background job's timeout. A day: long enough for a real sweep,
+#: short enough that a forgotten job does not hold a slot forever.
+DEFAULT_BACKGROUND_MAX_TIMEOUT = 86_400.0
+
+#: How many background jobs may run at once. Each one is a whole subprocess, so
+#: this bounds the machine's load rather than the server's bookkeeping.
+DEFAULT_MAX_BACKGROUND_JOBS = 4
+
+#: Finished background jobs kept in memory, newest kept. Their captured output
+#: is the bulk of what this costs; running jobs are never evicted.
+DEFAULT_JOB_HISTORY = 20
+
 #: Extra wall-clock slack the parent grants past the worker's own deadline
 #: before it gives up waiting and kills the process outright.
 TIMEOUT_GRACE = 5.0
@@ -131,30 +152,39 @@ def _resolve_base_url() -> str:
     return derive_base_url(host, int(_env_float("PYEXEC_PORT", DEFAULT_PORT)))
 
 
+def _secret(name: str, file_name: str) -> str | None:
+    """Read a credential from the environment, falling back to a file.
+
+    The file is offered because an environment variable shows up in ``ps``
+    output and in crash dumps, which is a poor place for a secret that guards
+    code execution or can post as a bot.
+
+    Raises:
+        ValueError: if a file is named but cannot be read.
+    """
+    value = _env_str(name)
+    if value is not None:
+        return value
+
+    path = _env_str(file_name)
+    if not path:
+        return None
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ValueError(
+            f"{file_name} points at {path!r}, which could not be read: {exc}"
+        ) from exc
+
+
 def _resolve_auth_token() -> str | None:
     """Read the HTTP bearer token, preferring the direct variable over a file.
-
-    A file is offered because an environment variable shows up in ``ps`` output
-    and in crash dumps, which is a poor place for a secret that guards code
-    execution.
 
     Raises:
         ValueError: if a token is configured but is too short to be worth
             anything.
     """
-    token = _env_str("PYEXEC_AUTH_TOKEN")
-
-    if token is None:
-        path = _env_str("PYEXEC_AUTH_TOKEN_FILE")
-        if path:
-            try:
-                token = Path(path).expanduser().read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                raise ValueError(
-                    f"PYEXEC_AUTH_TOKEN_FILE points at {path!r}, which could not "
-                    f"be read: {exc}"
-                ) from exc
-
+    token = _secret("PYEXEC_AUTH_TOKEN", "PYEXEC_AUTH_TOKEN_FILE")
     if token is None:
         return None
 
@@ -167,6 +197,47 @@ def _resolve_auth_token() -> str | None:
             '  python -c "import secrets; print(secrets.token_urlsafe(32))"'
         )
     return token
+
+
+def _resolve_telegram_token() -> str | None:
+    """Read the Telegram bot token, preferring the direct variable over a file.
+
+    The shape is checked because a mistyped token fails at the Bot API with a
+    404 that says nothing about where the mistake was, and notifications are
+    silent enough already. A bot token is always ``<numeric id>:<secret>``.
+
+    Raises:
+        ValueError: if a token is configured but cannot be one. The value itself
+            is deliberately kept out of the message.
+    """
+    token = _secret(
+        "PYEXEC_TELEGRAM_BOT_TOKEN", "PYEXEC_TELEGRAM_BOT_TOKEN_FILE"
+    )
+    if token is None:
+        return None
+
+    bot_id, separator, secret = token.partition(":")
+    if not separator or not bot_id.isdigit() or not secret:
+        raise ValueError(
+            "PYEXEC_TELEGRAM_BOT_TOKEN is not shaped like a bot token. They "
+            "look like '123456789:AA...', with the bot's numeric id in front of "
+            "the colon; @BotFather prints one when the bot is created."
+        )
+    return token
+
+
+def _resolve_telegram_proxy() -> str | None:
+    """Read the proxy used to reach Telegram, keeping "empty" and "unset" apart.
+
+    An empty value is how an operator says "connect directly" on a machine whose
+    ``HTTPS_PROXY`` belongs to other traffic -- so it must not collapse into the
+    unset default, which means "use whatever the environment says". That is
+    exactly what :func:`_env_str` does with empty strings, hence the raw read.
+    """
+    raw = os.environ.get("PYEXEC_TELEGRAM_PROXY")
+    if raw is None:
+        return None
+    return raw.strip()
 
 
 @dataclass(frozen=True)
@@ -193,6 +264,18 @@ class Settings:
     #: secrets) or run against a scrubbed one.
     inherit_env: bool
 
+    #: Timeout a background job gets when the caller does not ask for one, and
+    #: the ceiling for one they do. Separate from ``default_timeout`` /
+    #: ``max_timeout`` because those two are built around a caller who is
+    #: waiting on the line: escaping them is what a background job is for.
+    background_timeout: float = DEFAULT_BACKGROUND_TIMEOUT
+    background_max_timeout: float = DEFAULT_BACKGROUND_MAX_TIMEOUT
+
+    #: How many background jobs may run concurrently, and how many finished
+    #: ones are remembered. See :mod:`pyexec_mcp.jobs`.
+    max_background_jobs: int = DEFAULT_MAX_BACKGROUND_JOBS
+    job_history: int = DEFAULT_JOB_HISTORY
+
     #: Shared secret required from HTTP clients as ``Authorization: Bearer``.
     #: ``None`` disables authentication, which is only permitted on loopback.
     auth_token: str | None = None
@@ -204,6 +287,20 @@ class Settings:
     #: How long a signed download link stays valid, and the ceiling for a
     #: lifetime a caller asks for.
     download_ttl: float = DEFAULT_DOWNLOAD_TTL
+
+    #: Telegram bot token and target chat. Notifications are off unless both are
+    #: set; see :mod:`pyexec_mcp.telegram`.
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+    #: How long a run must take before it earns a message. Zero sends one for
+    #: every run.
+    telegram_min_duration: float = DEFAULT_TELEGRAM_MIN_DURATION
+
+    #: Proxy used to reach api.telegram.org. ``None`` honours the environment's
+    #: ``HTTPS_PROXY``, which is what a machine that already needs a proxy has
+    #: configured; the empty string forces a direct connection.
+    telegram_proxy: str | None = None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -228,9 +325,25 @@ class Settings:
             ),
             allowed_modules=allowed_modules,
             inherit_env=_env_bool("PYEXEC_INHERIT_ENV", True),
+            background_timeout=_env_float(
+                "PYEXEC_BACKGROUND_TIMEOUT", DEFAULT_BACKGROUND_TIMEOUT
+            ),
+            background_max_timeout=_env_float(
+                "PYEXEC_BACKGROUND_MAX_TIMEOUT", DEFAULT_BACKGROUND_MAX_TIMEOUT
+            ),
+            max_background_jobs=int(
+                _env_float("PYEXEC_MAX_BACKGROUND_JOBS", DEFAULT_MAX_BACKGROUND_JOBS)
+            ),
+            job_history=int(_env_float("PYEXEC_JOB_HISTORY", DEFAULT_JOB_HISTORY)),
             auth_token=_resolve_auth_token(),
             base_url=_resolve_base_url(),
             download_ttl=_env_float("PYEXEC_DOWNLOAD_TTL", DEFAULT_DOWNLOAD_TTL),
+            telegram_bot_token=_resolve_telegram_token(),
+            telegram_chat_id=_env_str("PYEXEC_TELEGRAM_CHAT_ID"),
+            telegram_min_duration=_env_float(
+                "PYEXEC_TELEGRAM_MIN_DURATION", DEFAULT_TELEGRAM_MIN_DURATION
+            ),
+            telegram_proxy=_resolve_telegram_proxy(),
         )
 
     def clamp_timeout(self, timeout: float | None) -> float:
@@ -238,6 +351,17 @@ class Settings:
         if timeout is None or timeout <= 0:
             return self.default_timeout
         return min(float(timeout), self.max_timeout)
+
+    def clamp_background_timeout(self, timeout: float | None) -> float:
+        """Fold a caller-supplied background timeout into the configured range.
+
+        Same shape as :meth:`clamp_timeout`, against the background pair. Those
+        are deliberately much larger: a caller reaches for a background job
+        exactly when the blocking ceiling is too small.
+        """
+        if timeout is None or timeout <= 0:
+            return self.background_timeout
+        return min(float(timeout), self.background_max_timeout)
 
     def clamp_download_ttl(self, ttl: float | None) -> float:
         """Fold a caller-supplied link lifetime into the configured range.

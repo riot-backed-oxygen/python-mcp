@@ -11,26 +11,32 @@ Tools and resources are declared here; execution lives in
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import sys
 import threading
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import BaseModel, Field
 
-from . import packages
+from . import jobs, packages, telegram
 from .auth import BearerTokenMiddleware
 from .config import Settings, is_loopback
 from .downloads import DOWNLOAD_PREFIX, DownloadRouter, build_url, workspace_relative
+from .jobs import JobLimitReached, JobManager
 from .sandbox import GuardrailError, check_code, resolve_within
-from .session import ExecutionSession, run_isolated
+from .session import ExecutionSession, SessionError, run_isolated
 
 SERVER_NAME = "pyexec_mcp"
+
+logger = logging.getLogger(__name__)
 
 mcp = MCPServer(
     SERVER_NAME,
@@ -46,6 +52,8 @@ mcp = MCPServer(
 
 _SETTINGS: Settings | None = None
 _SESSION: ExecutionSession | None = None
+_JOBS: JobManager | None = None
+#: Guards every module-level singleton above, not just _SESSION.
 _SESSION_LOCK = threading.Lock()
 
 
@@ -71,24 +79,54 @@ def session() -> ExecutionSession:
         return _SESSION
 
 
+def job_manager() -> JobManager:
+    """The background job registry, started on first use.
+
+    Built against the settings resolved at that moment, and rebuilt whenever
+    :func:`use_settings` swaps them: the concurrency cap and the history size
+    are configuration, and a job's worker has the workspace of its own
+    configuration as its working directory, so its records cannot be carried
+    across a change of one.
+    """
+    global _JOBS
+    with _SESSION_LOCK:
+        if _JOBS is None:
+            _JOBS = JobManager(settings(), on_finish=_announce_job)
+        return _JOBS
+
+
 @atexit.register
 def _close_session() -> None:
     if _SESSION is not None:
         _SESSION.close()
+    if _JOBS is not None:
+        _JOBS.shutdown()
 
 
 def use_settings(new_settings: Settings) -> None:
     """Swap in a different configuration, discarding the current session.
 
+    Running background jobs go with it. Their workers were started in the old
+    workspace, their artifact links were signed against the old address, and
+    their completion messages were addressed to whatever chat was configured
+    then -- so leaving them to finish would have them report on a world that no
+    longer exists. They are killed rather than forgotten, so no half-written
+    file is left with a process still adding to it.
+
     Exists so tests (and embedders) can point the server at a temporary
     workspace without going through the environment.
     """
-    global _SETTINGS, _SESSION
+    global _SETTINGS, _SESSION, _JOBS
     with _SESSION_LOCK:
         if _SESSION is not None:
             _SESSION.close()
         _SESSION = None
         _SETTINGS = new_settings
+        # Taken out of the lock before shutting it down: killing workers waits
+        # on processes, and nothing else should queue behind that.
+        manager, _JOBS = _JOBS, None
+    if manager is not None:
+        manager.shutdown()
 
 
 # --------------------------------------------------------------------------
@@ -199,6 +237,124 @@ class InstallReceipt(BaseModel):
     stderr: str
 
 
+class NotifyReceipt(BaseModel):
+    """Whether a message reached the configured Telegram chat."""
+
+    ok: bool = Field(description="True if Telegram accepted the message")
+    reason: str = Field(
+        default="",
+        description="Why the message did not go out, when ok is false",
+    )
+
+
+class JobReceipt(BaseModel):
+    """What a background submission produced, whether or not it was accepted."""
+
+    ok: bool = Field(
+        description="True if the job was registered and is now running. False means nothing was started."
+    )
+    job_id: str = Field(default="", description="Handle for the pyexec_job_* tools")
+    tool: str = Field(default="", description="The tool the job is running")
+    subject: str = Field(
+        default="", description="What it runs against: a script path, or a label"
+    )
+    state: str = Field(default="", description="Lifecycle state as of this reply")
+    timeout_s: float = Field(
+        default=0.0, description="Deadline the job runs under, after clamping"
+    )
+    artifacts: list[str] = Field(
+        default_factory=list,
+        description="Workspace-relative paths the completion message will link to",
+    )
+    notifies: bool = Field(
+        default=False,
+        description=(
+            "True if Telegram is configured, so this job's completion will be "
+            "announced. When false nothing will report on it: poll "
+            "pyexec_job_status, or tell whoever asked for the job to check back."
+        ),
+    )
+    reason: str = Field(
+        default="", description="Why nothing was started, when ok is false"
+    )
+
+
+class JobStatus(BaseModel):
+    """Where a background job has got to."""
+
+    job_id: str
+    tool: str
+    subject: str = ""
+    state: Literal["running", "done", "cancelled"]
+    ok: bool | None = Field(
+        default=None,
+        description=(
+            "The outcome. None while the job is still running -- deliberately "
+            "not false, which would read as a failure."
+        ),
+    )
+    started_at: str = Field(default="", description="ISO 8601 UTC time it was submitted")
+    finished_at: str | None = Field(default=None, description="ISO 8601 UTC, once it ends")
+    duration_s: float = Field(
+        default=0.0,
+        description="Wall-clock seconds so far for a running job, total for a finished one",
+    )
+    timeout_s: float = 0.0
+    error: str = Field(default="", description="'Type: message', set when the job failed")
+    excerpt: str = Field(default="", description="Tail of the output, for reading in a chat")
+    truncated: bool = False
+    artifacts: list[str] = Field(
+        default_factory=list, description="Paths the job declared it would produce"
+    )
+    missing_artifacts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Declared paths that were not there once the job finished. Empty "
+            "while it is still running -- a file it has not written yet is not "
+            "missing, it is pending."
+        ),
+    )
+    notified: bool = Field(
+        default=False,
+        description=(
+            "True if a Telegram message about this job was handed to the "
+            "delivery thread. Handed, not delivered: delivery failures are "
+            "logged rather than reported, so this cannot mean 'delivered'."
+        ),
+    )
+    note: str = Field(default="", description="The caveat that matters for this state")
+
+
+class JobListing(BaseModel):
+    """The background jobs this server still knows about."""
+
+    count: int
+    running: int = Field(description="How many are going right now")
+    limit: int = Field(description="How many may run at once")
+    history: int = Field(description="How many finished jobs are remembered")
+    jobs: list[JobStatus]
+
+
+class JobResult(ExecutionResult):
+    """A finished job's full output.
+
+    Extends the shape a blocking call returns, so a caller that already knows
+    how to read one knows how to read this.
+    """
+
+    job_id: str = ""
+    state: str = ""
+    artifacts: list[DownloadLink] = Field(
+        default_factory=list,
+        description="Signed links, rebuilt per call, for the artifacts that exist",
+    )
+    missing_artifacts: list[str] = Field(
+        default_factory=list,
+        description="Declared paths that were not there when the job finished",
+    )
+    note: str = Field(default="", description="Caveats about this particular job")
+
+
 # --------------------------------------------------------------------------
 # Shared helpers
 # --------------------------------------------------------------------------
@@ -229,6 +385,273 @@ def _guardrail_failure(exc: GuardrailError) -> ExecutionResult:
         stderr="",
         error=ExecutionError(type="GuardrailError", message=str(exc)),
         duration_ms=0.0,
+    )
+
+
+# --------------------------------------------------------------------------
+# Notifications
+# --------------------------------------------------------------------------
+
+def _summarise(
+    tool: str, result: ExecutionResult, duration_s: float, subject: str = ""
+) -> telegram.ExecutionSummary:
+    """Describe a finished run in the terms a notification needs."""
+    return telegram.ExecutionSummary(
+        tool=tool,
+        subject=subject,
+        ok=result.ok,
+        duration_s=duration_s,
+        error=(
+            f"{result.error.type}: {result.error.message}"
+            if result.error is not None
+            else ""
+        ),
+        excerpt=_excerpt(result),
+        truncated=result.truncated,
+        machine=telegram.machine_name(),
+    )
+
+
+def _excerpt(result: ExecutionResult) -> str:
+    """The tail of what a run produced, sized for a chat message.
+
+    The tail and not the head: the part worth reading is where the run ended up
+    -- the final total, the last progress line, the exception -- and Telegram
+    imposes a hard length limit regardless.
+    """
+    body = "\n".join(
+        part
+        for part in (result.stdout, result.stderr, result.raw_output)
+        if part.strip()
+    ).strip()
+
+    if not body:
+        # Nothing was printed, so the run's point was its value -- a computed
+        # total, a shape. Clipped from the front, since a repr leads with the
+        # structure that identifies it.
+        value = result.result or ""
+        if len(value) <= telegram.EXCERPT_CHARS:
+            return value
+        return value[: telegram.EXCERPT_CHARS] + "..."
+
+    if len(body) <= telegram.EXCERPT_CHARS:
+        return body
+    return "..." + body[-telegram.EXCERPT_CHARS :]
+
+
+def _announce(
+    tool: str, result: ExecutionResult, duration_s: float, subject: str = ""
+) -> None:
+    """Tell Telegram a run finished, when it ran long enough to want knowing.
+
+    Wall-clock time, not the worker's own measure of the snippet: what makes a
+    run worth a notification is how long its caller was left waiting, which
+    includes starting the interpreter and getting the output back.
+
+    Never raises. The run's outcome is settled by the time this is called, and a
+    chat message that cannot be delivered must not turn it into a failure.
+    """
+    try:
+        telegram.notify(settings(), _summarise(tool, result, duration_s, subject))
+    except Exception:  # noqa: BLE001 - a notification is strictly best effort
+        logger.exception("Could not queue the Telegram notification")
+
+
+# --------------------------------------------------------------------------
+# Background jobs
+# --------------------------------------------------------------------------
+
+def _iso_utc(when: float | None) -> str | None:
+    """Unix seconds as ISO 8601 UTC, the shape ``DownloadLink.expires_at`` uses."""
+    if when is None:
+        return None
+    return (
+        datetime.fromtimestamp(when, timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+
+
+def _download_link(
+    current: Settings, target: Path, ttl_seconds: float | None = None
+) -> DownloadLink:
+    """Build one signed, time-limited link to *target*.
+
+    The single place that knows how a link is shaped. Both
+    ``pyexec_get_download_url`` and a background job's artifacts come through
+    here, so a link looks the same whichever handed it out.
+    """
+    relative = workspace_relative(target, current.workspace)
+    url, expires = build_url(
+        current.base_url,
+        relative,
+        current.auth_token,
+        current.clamp_download_ttl(ttl_seconds),
+    )
+
+    if current.auth_token is None:
+        note = (
+            "This server has no PYEXEC_AUTH_TOKEN, so the link is unsigned. "
+            "That is only possible on a loopback bind, which means the link "
+            "works on this machine and nowhere else."
+        )
+    else:
+        note = (
+            "Anyone holding this URL can download the file until it expires, "
+            "so share it only with the person who asked for it."
+        )
+
+    return DownloadLink(
+        url=url,
+        path=relative,
+        filename=target.name,
+        size_bytes=target.stat().st_size,
+        expires_at=_iso_utc(expires) or "",
+        expires_in_seconds=max(0, int(expires - time.time())),
+        note=note,
+    )
+
+
+def _declare_artifacts(
+    artifacts: list[str] | None, current: Settings
+) -> tuple[str, ...]:
+    """Normalise declared artifact paths, refusing any that escape the workspace.
+
+    Stored as workspace-relative posix paths -- the spelling a download link
+    signs, so the same file cannot be named two ways -- but deliberately not
+    required to exist: producing them is the job.
+
+    Raises:
+        GuardrailError: if a path resolves outside the workspace. Checked here,
+            at submit, so a job that could never have produced the file is not
+            started only to fail an hour later.
+    """
+    declared: list[str] = []
+    for path in artifacts or []:
+        relative = workspace_relative(
+            resolve_within(path, current.workspace), current.workspace
+        )
+        if relative not in declared:
+            declared.append(relative)
+    return tuple(declared)
+
+
+def _artifact_state(
+    job: jobs.Job, current: Settings
+) -> tuple[list[DownloadLink], list[str]]:
+    """Links for the artifacts that exist, and the declared ones that do not.
+
+    Never raises. A job that declared a file it never wrote, or a server with no
+    address to build links from, must still report its outcome -- finishing is
+    the point, and the links are a convenience.
+    """
+    if not current.base_url:
+        # Nothing to build a link from. The files may well be sitting there;
+        # there is simply no address a person could reach them at, and calling
+        # them "missing" would be a lie about the job.
+        return [], []
+
+    links: list[DownloadLink] = []
+    missing: list[str] = []
+    for relative in job.artifacts:
+        try:
+            target = resolve_within(relative, current.workspace)
+            if not target.is_file():
+                missing.append(relative)
+                continue
+            links.append(_download_link(current, target))
+        except (GuardrailError, OSError):
+            missing.append(relative)
+    return links, missing
+
+
+def _job_note(job: jobs.Job) -> str:
+    """The caveat that matters for where this job has got to."""
+    if job.state == "cancelled":
+        return (
+            "This job was cancelled and its worker was killed. A killed process "
+            "gets no chance to flush a buffer or close a file, so any artifact "
+            "it declared may be incomplete. Processes the job started itself "
+            "were not killed with it."
+        )
+    if job.state == "running":
+        return "Still running; there is no result to fetch yet."
+    return ""
+
+
+def _announce_job(job: jobs.Job, result, duration_s: float) -> bool:
+    """Tell Telegram a background job landed. Returns whether it was queued.
+
+    Queued rather than delivered: :func:`telegram.notify` hands the message to a
+    daemon thread and reports only that it did. Delivery failures are logged, by
+    the same rule that makes a notification unable to change a result.
+
+    Never raises, and it cannot: the job's result is stored before this is
+    called, so a chat message that cannot be delivered must not turn a finished
+    job into a failed one.
+
+    Sent with ``always=True``, bypassing ``PYEXEC_TELEGRAM_MIN_DURATION``. The
+    threshold exists because a blocking call's caller already holds the result,
+    so a message about a short run is a duplicate; a job's caller has explicitly
+    stopped watching, so this message is the only report there will be.
+    """
+    current = settings()
+    links, _ = _artifact_state(job, current)
+    summary = replace(
+        _summarise(job.tool, _to_result(result), duration_s, job.subject),
+        job_id=job.id,
+        links=tuple(link.url for link in links),
+    )
+    try:
+        return telegram.notify(current, summary, always=True) is not None
+    except Exception:  # noqa: BLE001 - a notification is strictly best effort
+        logger.exception("Could not queue the Telegram notification for job %s", job.id)
+        return False
+
+
+def _job_status(job: jobs.Job, current: Settings) -> JobStatus:
+    """Describe a job in the terms a status poll reads."""
+    finished = job.state != "running"
+    result = _to_result(job.result) if job.result is not None else None
+    _, missing = _artifact_state(job, current)
+
+    return JobStatus(
+        job_id=job.id,
+        tool=job.tool,
+        subject=job.subject,
+        state=job.state,
+        # None, not False, while it is still going: a caller reads False as
+        # "it failed" and would say so.
+        ok=bool(result is not None and result.ok) if finished else None,
+        started_at=_iso_utc(job.started_at) or "",
+        finished_at=_iso_utc(job.finished_at),
+        duration_s=job.duration_s(),
+        timeout_s=job.timeout,
+        error=(
+            f"{result.error.type}: {result.error.message}"
+            if result is not None and result.error is not None
+            else ""
+        ),
+        excerpt=_excerpt(result) if result is not None else "",
+        truncated=bool(result is not None and result.truncated),
+        artifacts=list(job.artifacts),
+        missing_artifacts=missing if finished else [],
+        notified=job.notified,
+        note=_job_note(job),
+    )
+
+
+def _unknown_job(job_id: str) -> ToolError:
+    """The error a lookup raises for an id this process does not know.
+
+    It cannot tell "never existed" from "finished and was forgotten" from "the
+    server restarted", because all three leave no record -- so it says all
+    three rather than guessing at one.
+    """
+    return ToolError(
+        f"No such job: {job_id!r}. It may never have existed, it may have "
+        f"finished long enough ago to be forgotten (the last "
+        f"{settings().job_history} are kept), or the server may have restarted "
+        "since. Job records live in memory only. pyexec_job_status with no "
+        "argument lists what is still known."
     )
 
 
@@ -302,7 +725,10 @@ def pyexec_run(
         return _guardrail_failure(exc)
 
     deadline = settings().clamp_timeout(timeout)
-    return _to_result(session().request("exec", timeout=deadline, code=code))
+    started = time.monotonic()
+    result = _to_result(session().request("exec", timeout=deadline, code=code))
+    _announce("pyexec_run", result, time.monotonic() - started)
+    return result
 
 
 @mcp.tool(
@@ -350,7 +776,10 @@ def pyexec_run_isolated(
         return _guardrail_failure(exc)
 
     deadline = settings().clamp_timeout(timeout)
-    return _to_result(run_isolated(settings(), code, deadline))
+    started = time.monotonic()
+    result = _to_result(run_isolated(settings(), code, deadline))
+    _announce("pyexec_run_isolated", result, time.monotonic() - started)
+    return result
 
 
 @mcp.tool(
@@ -497,10 +926,18 @@ def pyexec_run_script(
             duration_ms=0.0,
         )
 
+    started = time.monotonic()
     call = run_isolated(
         current, _script_invocation(script, args or []), current.clamp_timeout(timeout)
     )
-    return _to_result(call)
+    result = _to_result(call)
+    _announce(
+        "pyexec_run_script",
+        result,
+        time.monotonic() - started,
+        subject=_display_path(script, current.workspace),
+    )
+    return result
 
 
 def _script_invocation(script: Path, args: list[str]) -> str:
@@ -801,16 +1238,21 @@ def pyexec_get_download_url(
         - "Show me the chart you just made" -> plot it to a .png from code,
           then return the URL from pyexec_get_download_url("chart.png").
         - "Export the results as csv" -> write the file, then link it.
+        - "Send me the report when it is ready" -> pyexec_notify can carry the
+          URL to Telegram, for someone who is no longer watching this session.
         - Don't use when: the content is small text you want to read anyway --
           pyexec_read_file puts it where you can reason about it.
 
     Raises:
-        ValueError: if the path is outside the workspace, is not a file, or the
-            server has no address to build a link from.
+        ToolError: if the path is outside the workspace, is not a file, or the
+            server has no address to build a link from. Raised as a ToolError
+            rather than a plain exception so the reason reaches you: anything
+            else arrives as a nameless "Error executing tool" with the
+            explanation stripped out.
     """
     current = settings()
     if not current.base_url:
-        raise ValueError(
+        raise ToolError(
             "This server has no address to build a download link from. Set "
             "PYEXEC_BASE_URL to the address clients use to reach it, e.g. "
             "http://192.168.1.10:8000, and restart."
@@ -819,46 +1261,15 @@ def pyexec_get_download_url(
     try:
         target = resolve_within(path, current.workspace)
     except GuardrailError as exc:
-        raise ValueError(str(exc)) from exc
+        raise ToolError(str(exc)) from exc
 
     if not target.is_file():
-        raise ValueError(
+        raise ToolError(
             f"No such file: {target}. Use pyexec_list_files to see what is in "
             "the workspace."
         )
 
-    relative = workspace_relative(target, current.workspace)
-    url, expires = build_url(
-        current.base_url,
-        relative,
-        current.auth_token,
-        current.clamp_download_ttl(ttl_seconds),
-    )
-    expires_in = max(0, int(expires - time.time()))
-
-    if current.auth_token is None:
-        note = (
-            "This server has no PYEXEC_AUTH_TOKEN, so the link is unsigned. "
-            "That is only possible on a loopback bind, which means the link "
-            "works on this machine and nowhere else."
-        )
-    else:
-        note = (
-            "Anyone holding this URL can download the file until it expires, "
-            "so share it only with the person who asked for it."
-        )
-
-    return DownloadLink(
-        url=url,
-        path=relative,
-        filename=target.name,
-        size_bytes=target.stat().st_size,
-        expires_at=datetime.fromtimestamp(expires, timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z"),
-        expires_in_seconds=expires_in,
-        note=note,
-    )
+    return _download_link(current, target, ttl_seconds)
 
 
 # --------------------------------------------------------------------------
@@ -958,6 +1369,558 @@ def pyexec_install_package(
 
 
 # --------------------------------------------------------------------------
+# Notification tool
+# --------------------------------------------------------------------------
+
+@mcp.tool(
+    name="pyexec_notify",
+    title="Send a Telegram message",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=False,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+def pyexec_notify(
+    message: Annotated[
+        str,
+        Field(
+            description="Text to send. Keep it short; Telegram caps a message at 4096 characters.",
+            min_length=1,
+            max_length=4000,
+        ),
+    ],
+) -> NotifyReceipt:
+    """Send a message to the chat this server is configured to notify.
+
+    Runs over the threshold already announce themselves, so this is for the rest:
+    a batch of calls that added up to a long job, a checkpoint worth reporting
+    before the long part starts, or an answer that matters enough to interrupt
+    someone. It waits for Telegram to answer, so `ok` is the real delivery
+    status rather than "queued".
+
+    Only works when the operator configured PYEXEC_TELEGRAM_BOT_TOKEN and
+    PYEXEC_TELEGRAM_CHAT_ID; otherwise `ok` is false and `reason` says so. The
+    message leaves this machine for Telegram's servers, so treat it as
+    publishing, not logging.
+
+    Args:
+        message: The text to send, as plain text.
+
+    Returns:
+        NotifyReceipt: `ok`, plus `reason` when Telegram refused the message or
+        the server has no bot configured. A refusal from Telegram itself quotes
+        its own explanation, since "chat not found" and "bot was blocked" are
+        fixed in different places.
+
+    Examples:
+        - "Tell me when this is done" on a job made of many short calls ->
+          pyexec_notify("Finished the 40 backtests, results in results.csv").
+        - Don't use when: a single call is already long -- those notify on their
+          own, provided the operator set a threshold worth waiting for.
+    """
+    try:
+        telegram.notifier(settings()).send(message)
+    except telegram.NotificationError as exc:
+        return NotifyReceipt(ok=False, reason=str(exc))
+    return NotifyReceipt(ok=True)
+
+
+# --------------------------------------------------------------------------
+# Background job tools
+# --------------------------------------------------------------------------
+
+def _job_receipt(job: jobs.Job, current: Settings) -> JobReceipt:
+    """What a submit hands back: what was started, and what to expect of it."""
+    return JobReceipt(
+        ok=True,
+        job_id=job.id,
+        tool=job.tool,
+        subject=job.subject,
+        state=job.state,
+        timeout_s=job.timeout,
+        artifacts=list(job.artifacts),
+        notifies=telegram.notifier(current).enabled,
+    )
+
+
+def _refused(tool: str, exc: Exception) -> JobReceipt:
+    """A submit that never became a job.
+
+    Deliberately a receipt rather than an exception, and deliberately no job: a
+    submission that was never going to work must not start, because a job that
+    runs and fails sends a notification about work that should never have begun.
+    """
+    return JobReceipt(ok=False, tool=tool, reason=f"{type(exc).__name__}: {exc}")
+
+
+def _require_job(job_id: str) -> jobs.Job:
+    """The named job, or a ToolError saying why there is none.
+
+    Raises:
+        ToolError: if this process has no such job.
+    """
+    job = job_manager().get(job_id)
+    if job is None:
+        raise _unknown_job(job_id)
+    return job
+
+
+def _tail(text: str, limit: int) -> str:
+    """The last *limit* characters, marked as clipped."""
+    if len(text) <= limit:
+        return text
+    return "..." + text[-limit:]
+
+
+@mcp.tool(
+    name="pyexec_run_background",
+    title="Run Python in the background",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+def pyexec_run_background(
+    code: Annotated[
+        str,
+        Field(
+            description=(
+                "Python source to execute. Runs in a fresh interpreter with an "
+                "empty namespace, not in the persistent session."
+            )
+        ),
+    ],
+    timeout: Annotated[
+        float | None,
+        Field(
+            description=(
+                "Seconds the job may run before its process is killed. Defaults "
+                "to PYEXEC_BACKGROUND_TIMEOUT and is capped at "
+                "PYEXEC_MAX_BACKGROUND_TIMEOUT -- a different, much larger range "
+                "than a blocking call gets."
+            )
+        ),
+    ] = None,
+    artifacts: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Workspace-relative files this job is expected to produce, e.g. "
+                "['results.csv', 'chart.png']. Those that exist when it finishes "
+                "are linked in the completion message and in pyexec_job_result."
+            )
+        ),
+    ] = None,
+    label: Annotated[
+        str,
+        Field(description="Short label for the notification, e.g. 'nightly sweep'."),
+    ] = "",
+) -> JobReceipt:
+    """Start a long run and return at once, with a job id to follow it by.
+
+    Use this when the work will outlast anyone's patience. A blocking call holds
+    the tool call open until the code finishes and is killed at
+    PYEXEC_MAX_TIMEOUT -- 300 seconds by default -- so an hour-long sweep cannot
+    be run that way at all. This returns as soon as the job is registered and
+    the work carries on in its own interpreter after the call has returned.
+
+    The job does not share the persistent session. It gets a fresh interpreter,
+    exactly as pyexec_run_isolated does, so it can neither read the session's
+    variables nor disturb them, and it does not take the session's lock, so jobs
+    run alongside each other and alongside pyexec_run. The price of that
+    isolation is that the only way to hand data in is through a file.
+
+    When the job finishes, one Telegram message carries its state, how long it
+    took, the tail of its output, and links to the artifacts it declared --
+    provided a bot token and chat id are configured, which `notifies` in the
+    receipt tells you. Unlike a blocking run, that message is not subject to
+    PYEXEC_TELEGRAM_MIN_DURATION: a job's caller has explicitly stopped watching,
+    so there is no result for the message to duplicate.
+
+    When `notifies` is false, nothing will report on this job and nobody will
+    look at it unless something asks. Say so, and hand the job id to whoever is
+    waiting: poll pyexec_job_status, or read pyexec_job_result later.
+
+    Args:
+        code: Python source, the same shape pyexec_run takes, including the
+            trailing expression whose repr comes back in `result`.
+        timeout: How long the job may run. Defaults to
+            PYEXEC_BACKGROUND_TIMEOUT (an hour) and is capped at
+            PYEXEC_MAX_BACKGROUND_TIMEOUT (a day).
+        artifacts: Files the job should produce, relative to the workspace.
+            Declaring one that is never written is not a failure -- it comes
+            back in `missing_artifacts`. Each one that exists gets a signed,
+            time-limited download link, the same kind pyexec_get_download_url
+            hands out.
+        label: A name for the job, for a sweep rather than a snippet. The job id
+            is always included in the message either way.
+
+    Returns:
+        JobReceipt: `ok` and the `job_id` to follow it by, or `ok` false with a
+        `reason` -- a syntax error or a blocked import, an artifact path outside
+        the workspace, an interpreter that would not start, or all the
+        configured job slots being busy. A refusal never creates a job.
+
+    Examples:
+        - "This sweep takes about an hour, tell me when it's done" ->
+          pyexec_run_background(code, artifacts=["results/sweep.csv"]) and give
+          the human the job id.
+        - "Kick off the training run, I'll check back" -> pyexec_run_background,
+          then pyexec_job_status(job_id) when asked.
+        - Don't use when: the code finishes in seconds -- pyexec_run_isolated
+          returns the answer directly, with no registry in between.
+        - Don't use when: the job needs the session's variables. Jobs are always
+          isolated; write the state to a file and read it from inside the job.
+        - Don't use when: the next step depends on the result. A job only works
+          when the next step can wait for a notification.
+    """
+    current = settings()
+    try:
+        _guard(code)
+        declared = _declare_artifacts(artifacts, current)
+    except GuardrailError as exc:
+        return _refused("pyexec_run_background", exc)
+
+    try:
+        job = job_manager().submit(
+            tool="pyexec_run_background",
+            subject=label,
+            code=code,
+            timeout=current.clamp_background_timeout(timeout),
+            artifacts=declared,
+        )
+    except (JobLimitReached, SessionError) as exc:
+        return _refused("pyexec_run_background", exc)
+
+    return _job_receipt(job, current)
+
+
+@mcp.tool(
+    name="pyexec_run_script_background",
+    title="Run a Python file in the background",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=True,
+    ),
+)
+def pyexec_run_script_background(
+    path: Annotated[
+        str, Field(description="Script path, absolute or relative to the workspace.")
+    ],
+    args: Annotated[
+        list[str] | None,
+        Field(description="Command-line arguments passed to the script."),
+    ] = None,
+    timeout: Annotated[
+        float | None,
+        Field(
+            description=(
+                "Seconds the job may run before its process is killed. Defaults "
+                "to PYEXEC_BACKGROUND_TIMEOUT and is capped at "
+                "PYEXEC_MAX_BACKGROUND_TIMEOUT."
+            )
+        ),
+    ] = None,
+    artifacts: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Workspace-relative files this job is expected to produce. Those "
+                "that exist when it finishes are linked in the notification."
+            )
+        ),
+    ] = None,
+) -> JobReceipt:
+    """Start a script on disk as a background job, and return at once.
+
+    The background counterpart of pyexec_run_script, and the right tool for a
+    sweep that already exists as a file: the worker runs it through `runpy` with
+    `sys.argv`, `__file__` and the `__main__` guard behaving normally, in its own
+    process, with the workspace as the working directory.
+
+    The file is read when the job starts, which is immediate -- but note that
+    editing the script afterwards changes nothing about the run in flight.
+
+    Args:
+        path: Script to run. Paths outside the workspace are rejected.
+        args: Arguments placed in `sys.argv[1:]`.
+        timeout: How long the job may run; see pyexec_run_background.
+        artifacts: Files the job should produce; see pyexec_run_background.
+
+    Returns:
+        JobReceipt: The same shape pyexec_run_background returns, with `subject`
+        set to the script's workspace-relative path so the notification says
+        which script finished.
+
+    Examples:
+        - "Run the nightly report and ping me" ->
+          pyexec_run_script_background("reports/nightly.py",
+          artifacts=["out/nightly.csv"]).
+        - Don't use when: the script finishes in seconds -- pyexec_run_script
+          gives the output directly.
+    """
+    current = settings()
+    try:
+        script = resolve_within(path, current.workspace)
+        declared = _declare_artifacts(artifacts, current)
+    except GuardrailError as exc:
+        return _refused("pyexec_run_script_background", exc)
+
+    if not script.is_file():
+        return JobReceipt(
+            ok=False,
+            tool="pyexec_run_script_background",
+            reason=(
+                f"FileNotFoundError: no such file: {script}. Use "
+                "pyexec_list_files to see what is in the workspace."
+            ),
+        )
+
+    try:
+        job = job_manager().submit(
+            tool="pyexec_run_script_background",
+            subject=_display_path(script, current.workspace),
+            code=_script_invocation(script, args or []),
+            timeout=current.clamp_background_timeout(timeout),
+            artifacts=declared,
+        )
+    except (JobLimitReached, SessionError) as exc:
+        return _refused("pyexec_run_script_background", exc)
+
+    return _job_receipt(job, current)
+
+
+@mcp.tool(
+    name="pyexec_job_status",
+    title="Check on background jobs",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def pyexec_job_status(
+    job_id: Annotated[
+        str | None,
+        Field(
+            description=(
+                "The handle a submit returned. Omit it to list every job this "
+                "server still knows about."
+            )
+        ),
+    ] = None,
+) -> JobListing:
+    """Report where a background job has got to, or list them all.
+
+    This reads the server's own registry and makes no call into any worker, so
+    it is cheap and safe to poll -- a running job is reported as `running` no
+    matter how long it has been going, and polling it neither slows it down nor
+    disturbs the persistent session.
+
+    `ok` is deliberately None while a job is running rather than false, because
+    false would read as "it failed". Check `state` for whether there is anything
+    to fetch yet.
+
+    Args:
+        job_id: A job to look up. Omit to list everything known.
+
+    Returns:
+        JobListing: `jobs`, newest first, each with its `state`, elapsed
+        `duration_s`, an `excerpt` of the output so far, the artifacts it
+        declared and which of those are `missing_artifacts`, and a `note`
+        carrying whatever caveat matters for that state. `running` and `limit`
+        describe the server as a whole rather than any one job.
+
+    Raises:
+        ToolError: if `job_id` names no job this server knows. Job records live
+            in memory, so one can also be missing because the server restarted
+            or because it finished long enough ago to be forgotten. Raised as a
+            ToolError rather than a plain exception because the reason has to
+            reach you: anything else is reported to the client as a nameless
+            "Error executing tool pyexec_job_status", which tells you nothing
+            about which of those three happened.
+
+    Examples:
+        - "Is that sweep done yet?" -> pyexec_job_status("job-1a2b3c4d")
+        - "What's running?" -> pyexec_job_status()
+        - Don't use when: you want the actual output -- pyexec_job_result
+          returns it, this only reports where the job got to.
+    """
+    current = settings()
+    manager = job_manager()
+
+    if job_id is None:
+        known = manager.all()
+    else:
+        known = [_require_job(job_id)]
+
+    return JobListing(
+        count=len(known),
+        running=len(manager.running()),
+        limit=manager.limit,
+        history=manager.history,
+        jobs=[_job_status(job, current) for job in known],
+    )
+
+
+@mcp.tool(
+    name="pyexec_job_result",
+    title="Fetch a finished job's output",
+    annotations=ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def pyexec_job_result(
+    job_id: Annotated[str, Field(description="The handle a submit returned.")],
+    max_chars: Annotated[
+        int,
+        Field(
+            description=(
+                "Return only the last N characters of each stream. Zero returns "
+                "everything the job produced, up to the configured output cap."
+            ),
+            ge=0,
+        ),
+    ] = 0,
+) -> JobResult:
+    """Read everything a finished background job produced.
+
+    The notification carries only a tail of the output, because a chat message
+    is a glance rather than a transcript. This is where the rest of it is: the
+    full `stdout`, `stderr`, the repr of a trailing expression in `result`, and
+    an `error` object with the exception type, message and traceback when the
+    job failed.
+
+    `max_chars` is worth setting for a job known to be chatty. A long run is
+    exactly the kind that prints a great deal, and this is the one call that
+    would put all of it in front of the model at once.
+
+    Args:
+        job_id: The job to read.
+        max_chars: Keep only the last N characters of each stream, 0 for all of
+            it. Truncation by the server's output cap is separate and reported
+            in `truncated`.
+
+    Returns:
+        JobResult: The same fields a blocking call returns, plus the `job_id`,
+        the final `state`, signed download links for the `artifacts` that exist,
+        the declared ones that do not in `missing_artifacts`, and a `note` with
+        any caveat -- for a cancelled job, that a killed process gets no chance
+        to finish writing what it had started.
+
+    Raises:
+        ToolError: if the job is unknown, or is still running. A result that
+            does not exist yet is not reported as a failure, because `ok` false
+            would be read as "it failed" and said out loud. The reason travels
+            as a ToolError so that it actually arrives -- see pyexec_job_status.
+
+    Examples:
+        - The notification says a job failed -> pyexec_job_result(job_id) to
+          read the traceback.
+        - A job printed megabytes -> pyexec_job_result(job_id, max_chars=4000).
+        - Don't use when: the job is still running -- pyexec_job_status is the
+          one to poll.
+    """
+    current = settings()
+    job = _require_job(job_id)
+
+    if job.state == "running":
+        raise ToolError(
+            f"Job {job_id} is still running, so there is no result yet. Poll "
+            "pyexec_job_status, or wait for the notification. An empty result "
+            "here would read as a failure."
+        )
+
+    result = (
+        _to_result(job.result)
+        if job.result is not None
+        else ExecutionResult(ok=False, stdout="", stderr="", duration_ms=0.0)
+    )
+    if max_chars:
+        result = result.model_copy(
+            update={
+                "stdout": _tail(result.stdout, max_chars),
+                "stderr": _tail(result.stderr, max_chars),
+                "raw_output": _tail(result.raw_output, max_chars),
+            }
+        )
+
+    links, missing = _artifact_state(job, current)
+    return JobResult(
+        **result.model_dump(),
+        job_id=job.id,
+        state=job.state,
+        artifacts=links,
+        missing_artifacts=missing,
+        note=_job_note(job),
+    )
+
+
+@mcp.tool(
+    name="pyexec_job_cancel",
+    title="Stop a background job",
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=True,
+        openWorldHint=False,
+    ),
+)
+def pyexec_job_cancel(
+    job_id: Annotated[str, Field(description="The handle a submit returned.")],
+) -> JobStatus:
+    """Kill a running background job and report where it ended up.
+
+    Use this for a job that turned out to be wrong -- a bad parameter, a loop
+    that will never terminate, work no longer wanted -- and for freeing a job
+    slot when the concurrency limit is reached.
+
+    Cancelling is idempotent: a job that has already finished, or was already
+    cancelled, is returned unchanged rather than treated as an error, so a
+    retried cancel is harmless.
+
+    The kill is immediate and the process gets no chance to tidy up. Anything it
+    had already written stays in the workspace and may be half-finished, which
+    the returned `note` says. Processes the job started itself are not killed
+    with it.
+
+    Args:
+        job_id: The job to stop.
+
+    Returns:
+        JobStatus: The job as it stands after the cancel. `state` is
+        `cancelled` when this call is what stopped it, and otherwise whatever it
+        had already reached.
+
+    Raises:
+        ToolError: if `job_id` names no job this server knows. The reason
+            travels as a ToolError so that it actually arrives -- see
+            pyexec_job_status.
+
+    Examples:
+        - "Stop that sweep, the parameters were wrong" ->
+          pyexec_job_cancel("job-1a2b3c4d").
+        - "No job slots left" -> pyexec_job_status to see what is running, then
+          cancel the one that no longer matters.
+        - Don't use when: the job is already done -- that is a status question,
+          and this returns the same answer without changing anything.
+    """
+    current = settings()
+    job = _require_job(job_id)
+    return _job_status(job_manager().cancel(job_id) or job, current)
+
+
+# --------------------------------------------------------------------------
 # Resources
 # --------------------------------------------------------------------------
 
@@ -966,7 +1929,8 @@ def pyexec_install_package(
     name="Effective configuration",
     description=(
         "The settings this server resolved from its environment: workspace, "
-        "interpreter, timeouts, output cap and import allowlist."
+        "interpreter, timeouts, output cap, import allowlist and background "
+        "job limits."
     ),
     mime_type="application/json",
 )
@@ -990,6 +1954,22 @@ def config_resource() -> str:
             "inherit_env": current.inherit_env,
             "base_url": current.base_url,
             "download_ttl": current.download_ttl,
+            "telegram": {
+                "enabled": telegram.notifier(current).enabled,
+                "chat_id": current.telegram_chat_id,
+                "min_duration": current.telegram_min_duration,
+            },
+            # Read from the global rather than through job_manager(): that
+            # accessor builds one, and a resource whose job is to describe the
+            # configuration should not start machinery to do it. A limit is
+            # still worth reporting on a server that has submitted nothing.
+            "jobs": {
+                "running": len(_JOBS.running()) if _JOBS is not None else 0,
+                "limit": current.max_background_jobs,
+                "history": current.job_history,
+                "background_timeout": current.background_timeout,
+                "background_max_timeout": current.background_max_timeout,
+            },
             "session_alive": session().alive,
         },
         indent=2,
@@ -1044,6 +2024,31 @@ def _resolve_settings_or_exit() -> Settings:
         return settings()
     except ValueError as exc:
         raise SystemExit(f"pyexec-mcp: {exc}") from None
+
+
+def _report_notifications(current: Settings) -> None:
+    """Say once, at startup, whether long runs will be announced.
+
+    The half-configured bot is the case worth catching: a token with no chat id
+    looks like a working setup, silently sends nothing, and the first symptom
+    would be a long run nobody was told about.
+    """
+    log = logging.getLogger("pyexec_mcp.telegram")
+
+    if current.telegram_bot_token and not current.telegram_chat_id:
+        log.warning(
+            "PYEXEC_TELEGRAM_BOT_TOKEN is set but PYEXEC_TELEGRAM_CHAT_ID is "
+            "not, so no notifications will be sent: a bot cannot pick a chat on "
+            "its own. Send the bot a message, then read the chat id from "
+            "https://api.telegram.org/bot<token>/getUpdates."
+        )
+    elif telegram.notifier(current).enabled:
+        log.info(
+            "Telegram notifications on, chat %s: runs of %gs or longer are "
+            "announced, and pyexec_notify is available for anything shorter.",
+            current.telegram_chat_id,
+            current.telegram_min_duration,
+        )
 
 
 def run_http(host: str = "127.0.0.1", port: int = 8000, **kwargs: Any) -> None:
@@ -1127,7 +2132,7 @@ def main(
     _load_env_file()
     # Resolved up front so a bad setting is reported once, cleanly, instead of
     # surfacing from whichever code path happens to touch it first.
-    _resolve_settings_or_exit()
+    _report_notifications(_resolve_settings_or_exit())
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:

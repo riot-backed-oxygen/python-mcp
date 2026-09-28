@@ -29,10 +29,19 @@ ENV_KEYS = {
     "timeout": "PYEXEC_TIMEOUT",
     "max_timeout": "PYEXEC_MAX_TIMEOUT",
     "max_output_chars": "PYEXEC_MAX_OUTPUT_CHARS",
+    "background_timeout": "PYEXEC_BACKGROUND_TIMEOUT",
+    "background_max_timeout": "PYEXEC_BACKGROUND_MAX_TIMEOUT",
+    "max_background_jobs": "PYEXEC_MAX_BACKGROUND_JOBS",
+    "job_history": "PYEXEC_JOB_HISTORY",
     "download_ttl": "PYEXEC_DOWNLOAD_TTL",
     "allowed_modules": "PYEXEC_ALLOWED_MODULES",
     "auth_token": "PYEXEC_AUTH_TOKEN",
     "auth_token_file": "PYEXEC_AUTH_TOKEN_FILE",
+    "telegram_bot_token": "PYEXEC_TELEGRAM_BOT_TOKEN",
+    "telegram_bot_token_file": "PYEXEC_TELEGRAM_BOT_TOKEN_FILE",
+    "telegram_chat_id": "PYEXEC_TELEGRAM_CHAT_ID",
+    "telegram_min_duration": "PYEXEC_TELEGRAM_MIN_DURATION",
+    "telegram_proxy": "PYEXEC_TELEGRAM_PROXY",
 }
 
 
@@ -97,6 +106,41 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-output-chars", type=int, help="Per-stream output retained before truncation."
     )
     parser.add_argument(
+        "--background-timeout",
+        type=float,
+        help=(
+            "Default timeout for a background job, in seconds. Kept separate "
+            "from --timeout because escaping that ceiling is the whole point of "
+            "running something in the background."
+        ),
+    )
+    parser.add_argument(
+        "--background-max-timeout",
+        type=float,
+        help=(
+            "Ceiling for a timeout a caller passes to a background job. Higher "
+            "than --max-timeout for the same reason, and worth keeping finite: a "
+            "forgotten job otherwise holds its slot indefinitely."
+        ),
+    )
+    parser.add_argument(
+        "--max-background-jobs",
+        type=int,
+        help=(
+            "How many background jobs may run at once. Each is a whole "
+            "subprocess, so this bounds the machine's load. Further submissions "
+            "are refused rather than queued."
+        ),
+    )
+    parser.add_argument(
+        "--job-history",
+        type=int,
+        help=(
+            "How many finished background jobs stay readable. Records live in "
+            "memory only, so this also bounds what a restart would cost."
+        ),
+    )
+    parser.add_argument(
         "--allowed-modules",
         help=(
             "Comma-separated allowlist of importable top-level modules. "
@@ -117,6 +161,42 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Read the bearer token from this file instead of the command line. "
             "Trailing whitespace is stripped."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-bot-token",
+        help=(
+            "Telegram bot token from @BotFather. With --telegram-chat-id, long "
+            "runs announce themselves in that chat. Prefer the environment "
+            "variable or --telegram-bot-token-file, so the secret stays out of "
+            "the process listing."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-bot-token-file",
+        help="Read the Telegram bot token from this file instead.",
+    )
+    parser.add_argument(
+        "--telegram-chat-id",
+        help=(
+            "Chat the notifications go to. A bot cannot find this on its own: "
+            "message it once and read the id from getUpdates."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-min-duration",
+        type=float,
+        help=(
+            "Seconds a run must take before it is announced. 0 announces every "
+            "run."
+        ),
+    )
+    parser.add_argument(
+        "--telegram-proxy",
+        help=(
+            "Proxy for reaching api.telegram.org, e.g. http://127.0.0.1:7890. "
+            "Defaults to the environment's HTTPS_PROXY; pass an empty value to "
+            "connect directly."
         ),
     )
     parser.add_argument(

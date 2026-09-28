@@ -7,6 +7,8 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,10 +17,33 @@ import pytest
 
 from pyexec_mcp import server
 from pyexec_mcp.config import Settings
+from pyexec_mcp.telegram import TelegramNotifier
 
 #: Bearer token the live servers in this suite are started with. Long enough to
 #: clear the minimum the server enforces.
 LIVE_TOKEN = "correct-horse-battery-staple-32chars"
+
+#: A well-formed but entirely fake bot token, and a chat id shaped like the ones
+#: Telegram really hands out.
+BOT_TOKEN = "123456789:AAF-not-a-real-token"
+CHAT_ID = "-1001234567890"
+
+#: Every variable Telegram configuration reads, so a developer's own
+#: environment cannot decide what a test sees.
+TELEGRAM_VARS = (
+    "PYEXEC_TELEGRAM_BOT_TOKEN",
+    "PYEXEC_TELEGRAM_BOT_TOKEN_FILE",
+    "PYEXEC_TELEGRAM_CHAT_ID",
+    "PYEXEC_TELEGRAM_MIN_DURATION",
+    "PYEXEC_TELEGRAM_PROXY",
+)
+
+
+@pytest.fixture(autouse=True)
+def clean_telegram_environment(monkeypatch):
+    """Keep a real bot token out of every test, everywhere in this suite."""
+    for name in TELEGRAM_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 @pytest.fixture
@@ -47,6 +72,99 @@ def workspace(tmp_path, make_settings):
     server.use_settings(make_settings(tmp_path))
     yield tmp_path
     server.use_settings(make_settings(tmp_path))  # closes the session
+
+
+# --------------------------------------------------------------------------
+# Notification fixtures
+# --------------------------------------------------------------------------
+
+class FakeResponse:
+    def __init__(self, body: bytes, status: int = 200):
+        self._body = body
+        self.status = status
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "FakeResponse":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+
+class FakeOpener:
+    """Stands in for the urllib opener and records what would have been posted."""
+
+    def __init__(self, body: bytes = b'{"ok": true}', error: Exception | None = None):
+        self.body = body
+        self.error = error
+        self.requests: list[urllib.request.Request] = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        if self.error is not None:
+            raise self.error
+        return FakeResponse(self.body)
+
+    @property
+    def url(self) -> str:
+        return self.requests[-1].full_url
+
+    @property
+    def fields(self) -> dict[str, str]:
+        """The form fields of the last request, decoded."""
+        return {
+            key: values[0]
+            for key, values in urllib.parse.parse_qs(
+                self.requests[-1].data.decode("utf-8")
+            ).items()
+        }
+
+
+@pytest.fixture
+def fake_api(monkeypatch):
+    """Make every notifier post to a fake Bot API instead of the network."""
+    opener = FakeOpener()
+    monkeypatch.setattr(TelegramNotifier, "_opener", lambda self: opener)
+    return opener
+
+
+@pytest.fixture
+def sent(monkeypatch):
+    """Capture messages instead of sending them; the list is the assertion surface."""
+    messages: list[str] = []
+    monkeypatch.setattr(
+        TelegramNotifier, "send", lambda self, text: messages.append(text)
+    )
+    return messages
+
+
+@pytest.fixture
+def configured(make_settings, workspace):
+    """Point the server at a configured bot, with delivery under test control."""
+    settings = make_settings(
+        workspace,
+        telegram_bot_token=BOT_TOKEN,
+        telegram_chat_id=CHAT_ID,
+        telegram_min_duration=0.0,
+    )
+    server.use_settings(settings)
+    return settings
+
+
+def wait_for(predicate, timeout: float = 20.0) -> bool:
+    """Poll until *predicate* holds.
+
+    Both the notifier and a background job finish their work on a thread, so
+    "it will happen eventually" is the only honest assertion available.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
 
 
 # --------------------------------------------------------------------------

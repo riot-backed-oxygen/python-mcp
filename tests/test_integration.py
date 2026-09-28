@@ -8,6 +8,7 @@ a server that dies on startup, a bad entry point.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -28,6 +29,13 @@ EXPECTED_TOOLS = {
     "pyexec_list_files",
     "pyexec_list_packages",
     "pyexec_install_package",
+    "pyexec_get_download_url",
+    "pyexec_notify",
+    "pyexec_run_background",
+    "pyexec_run_script_background",
+    "pyexec_job_status",
+    "pyexec_job_result",
+    "pyexec_job_cancel",
 }
 
 
@@ -43,6 +51,31 @@ def server_params(workspace) -> StdioServerParameters:
         args=["-m", "pyexec_mcp", "--workspace", str(workspace)],
         env=env,
     )
+
+
+def non_string_annotations(schema) -> list[str]:
+    """Find `description`/`title` values that are not strings, anywhere in a schema.
+
+    A JSON Schema rejects these outright: the client answers the whole tool call
+    with `HTTP 400: Invalid schema for function ...`, so the tool is unusable and
+    every direct-call test still passes. The usual cause is a stray comma turning
+    `description=("...")` into a one-element tuple, which serialises to a list.
+    """
+    found: list[str] = []
+
+    def walk(node, path: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                here = f"{path}.{key}" if path else key
+                if key in {"description", "title", "name"} and not isinstance(value, str):
+                    found.append(f"{here} is {type(value).__name__}, not str: {value!r}")
+                walk(value, here)
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                walk(value, f"{path}[{index}]")
+
+    walk(schema, "")
+    return found
 
 
 def payload(result) -> dict:
@@ -69,6 +102,73 @@ async def test_tools_are_discoverable_over_stdio(tmp_path):
             for tool in listing.tools:
                 assert tool.description, f"{tool.name} has no description"
                 assert tool.input_schema, f"{tool.name} has no input schema"
+                # A schema the client will not accept is worse than a missing
+                # one: the tool still appears in the listing and only rejects
+                # when called.
+                schemas = {"input": tool.input_schema}
+                if getattr(tool, "output_schema", None):
+                    schemas["output"] = tool.output_schema
+                for kind, schema in schemas.items():
+                    assert not (
+                        bad := non_string_annotations(schema)
+                    ), f"{tool.name} has a {kind} schema the client will reject: {bad}"
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_reaches_the_client_with_its_reason(tmp_path):
+    """An anticipated failure must arrive as text, not as a bare "it failed".
+
+    The SDK turns any unexpected exception into `Error executing tool <name>`
+    with the message stripped, so a tool that raises a plain ValueError is
+    telling the model nothing -- which for a lookup tool is the entire answer.
+    """
+    async with stdio_client(server_params(tmp_path)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            result = await session.call_tool(
+                "pyexec_job_status", {"job_id": "job-nosuchid"}
+            )
+
+            assert result.is_error
+            text = result.content[0].text
+            assert "No such job" in text
+            assert "memory only" in text
+
+
+@pytest.mark.asyncio
+async def test_a_background_job_is_reachable_over_the_protocol(tmp_path):
+    async with stdio_client(server_params(tmp_path)) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+
+            receipt = await session.call_tool(
+                "pyexec_run_background", {"code": "print('hands off')"}
+            )
+            body = payload(receipt)
+
+            assert body["ok"] is True
+            assert body["state"] == "running"
+            # Returns before the code has run, which is the whole point.
+            assert not (tmp_path / "late.txt").exists()
+
+            for _ in range(200):
+                status = payload(
+                    await session.call_tool(
+                        "pyexec_job_status", {"job_id": body["job_id"]}
+                    )
+                )
+                if status["jobs"][0]["ok"]:
+                    break
+                await asyncio.sleep(0.05)
+
+            result = payload(
+                await session.call_tool(
+                    "pyexec_job_result", {"job_id": body["job_id"]}
+                )
+            )
+            assert result["ok"] is True
+            assert "hands off" in result["stdout"]
 
 
 @pytest.mark.asyncio

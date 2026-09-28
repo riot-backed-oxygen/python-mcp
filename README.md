@@ -2,7 +2,7 @@
 
 一个用 FastMCP 实现的 MCP server，让 LLM 能在这台机器上执行 Python 代码。
 
-提供两种执行模型：**持久会话**（变量跨调用保留，像 notebook）和**一次性隔离进程**（每次全新解释器，互不污染），外加脚本运行、文件读写、依赖安装等配套工具。
+提供三种执行模型：**持久会话**（变量跨调用保留，像 notebook）、**一次性隔离进程**（每次全新解释器，互不污染）和**后台任务**（下达即返回，跑完自动通知），外加脚本运行、文件读写、依赖安装等配套工具。
 
 ---
 
@@ -77,12 +77,18 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `pyexec_run` | 在持久会话里执行代码，变量跨调用保留 |
 | `pyexec_run_isolated` | 在全新解释器里执行，跑完即弃 |
 | `pyexec_run_script` | 以 `__main__` 方式运行磁盘上的 .py 文件 |
+| `pyexec_run_background` | 把代码丢到后台跑，立刻返回 job id |
+| `pyexec_run_script_background` | 把磁盘上的 .py 丢到后台跑，立刻返回 job id |
+| `pyexec_job_status` | 查一个后台任务的状态；不带参数则列出全部 |
+| `pyexec_job_result` | 取后台任务的完整 stdout/stderr/返回值 |
+| `pyexec_job_cancel` | 杀掉在跑的后台任务 |
 | `pyexec_reset_session` | 重启会话，清空所有变量和 import |
 | `pyexec_session_info` | 查看会话里已定义了哪些变量、用的哪个解释器 |
 | `pyexec_read_file` | 读取工作区内的文本文件 |
 | `pyexec_write_file` | 写入工作区内的文件 |
 | `pyexec_list_files` | 列出工作区文件，支持 glob 和递归 |
 | `pyexec_get_download_url` | 生成一个带签名的限时下载地址，浏览器直接点开 |
+| `pyexec_notify` | 往 Telegram 发一条消息（配了才可用） |
 | `pyexec_list_packages` | 列出可 import 的已安装包 |
 | `pyexec_install_package` | 安装依赖到执行代码所用的解释器 |
 
@@ -94,9 +100,14 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 需要上一步的变量？        → pyexec_run
 需要干净环境 / 可能崩？    → pyexec_run_isolated
 跑的是已存在的文件？       → pyexec_run_script
-会话里状态乱了想重来？     → pyexec_reset_session
+跑得久、不想干等？         → pyexec_run_background / pyexec_run_script_background
+要看后台任务跑完没有？     → pyexec_job_status
 要把生成的文件给人？       → pyexec_get_download_url
+跑得久想被通知一声？       → pyexec_notify（够久的运行会自动通知，见「Telegram 通知」）
+会话里状态乱了想重来？     → pyexec_reset_session
 ```
+
+判断标准是**下一步能不能等**：跑完还要接着用结果，就老老实实用阻塞版；跑完这一步就结束了，才用后台版。后台任务的返回值只有一个 job id，拿不到结果本身。
 
 ---
 
@@ -111,6 +122,10 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `PYEXEC_TIMEOUT` | `30` | 单次调用的默认超时（秒） |
 | `PYEXEC_MAX_TIMEOUT` | `300` | 调用方传入超时的上限 |
 | `PYEXEC_MAX_OUTPUT_CHARS` | `40000` | 每个输出流保留的字符数，超出截断 |
+| `PYEXEC_BACKGROUND_TIMEOUT` | `3600` | 后台任务没传 timeout 时用的默认超时（秒） |
+| `PYEXEC_BACKGROUND_MAX_TIMEOUT` | `86400` | 后台任务 timeout 的上限（秒） |
+| `PYEXEC_MAX_BACKGROUND_JOBS` | `4` | 同时最多跑几个后台任务，超了直接拒绝 |
+| `PYEXEC_JOB_HISTORY` | `20` | 已完成的后台任务保留几条（只在内存里） |
 | `PYEXEC_ALLOWED_MODULES` | 未设置 | 允许 import 的顶层模块白名单，逗号分隔 |
 | `PYEXEC_INHERIT_ENV` | `1` | 是否让 worker 继承服务器环境变量 |
 | `PYEXEC_ENV_FILE` | `.env` | 启动时合并这个文件里的变量 |
@@ -118,6 +133,11 @@ claude mcp add pyexec -- /绝对路径/python-mcp/.venv/Scripts/python.exe -m py
 | `PYEXEC_DOWNLOAD_TTL` | `3600` | 下载链接有效期（秒），也是单次请求能要到的上限 |
 | `PYEXEC_AUTH_TOKEN` | 未设置 | streamable-http 的 Bearer 令牌，至少 16 字符 |
 | `PYEXEC_AUTH_TOKEN_FILE` | 未设置 | 从文件读令牌；`PYEXEC_AUTH_TOKEN` 优先 |
+| `PYEXEC_TELEGRAM_BOT_TOKEN` | 未设置 | Telegram 机器人令牌，`@BotFather` 给的那个 |
+| `PYEXEC_TELEGRAM_BOT_TOKEN_FILE` | 未设置 | 从文件读机器人令牌；上面的变量优先 |
+| `PYEXEC_TELEGRAM_CHAT_ID` | 未设置 | 消息发到哪个会话；和令牌**两个都配**才启用 |
+| `PYEXEC_TELEGRAM_MIN_DURATION` | `60` | 墙钟耗时达到这个秒数的运行，结束后自动通知；`0` 表示每次都通知 |
+| `PYEXEC_TELEGRAM_PROXY` | 跟随环境变量 | 访问 `api.telegram.org` 用的代理；设成空值表示直连 |
 
 ### 用 `.env` 配
 
@@ -234,6 +254,116 @@ curl -sS --noproxy '*' -O -J "http://127.0.0.1:8000/download/chart.png?exp=...&s
 
 ---
 
+## Telegram 通知（可选）
+
+长时间脚本的痛点不是慢，是**没法盯着**：工具调用要等代码跑完才返回，十分钟的脚本就是十分钟的信息真空。配一个 bot，跑得够久的任务结束时给自己发一条消息，带上结果和输出的结尾。
+
+```bash
+# .env
+PYEXEC_TELEGRAM_BOT_TOKEN=123456789:AA...     # @BotFather 创建 bot 时给的
+PYEXEC_TELEGRAM_CHAT_ID=-1001234567890
+PYEXEC_TELEGRAM_MIN_DURATION=60               # 跑够 60 秒才通知，0 表示每次都通知
+PYEXEC_TELEGRAM_PROXY=http://127.0.0.1:7890   # 连不上 api.telegram.org 时用
+```
+
+**chat id 从哪来**：bot 自己不知道要发给谁。先给 bot 发一条消息（比如 `/start`），然后：
+
+```bash
+curl -sS --noproxy '*' "https://api.telegram.org/bot<token>/getUpdates" | grep -o '"chat":{"id":[-0-9]*'
+```
+
+令牌和 chat id **两个都配齐才生效**。只配一半不会报错——只会在启动日志里留一条 warning，因为"看起来配了、其实什么都没发"是最难查的那种。令牌格式也会在启动时检查（bot token 一律是 `<数字 id>:<密钥>`），格式不对直接拒绝启动并说明去哪拿，且报错信息里**不会回显令牌本身**。
+
+触发方式有三种：
+
+- **自动**：`pyexec_run` / `pyexec_run_isolated` / `pyexec_run_script` 的**墙钟耗时**超过 `PYEXEC_TELEGRAM_MIN_DURATION` 就发一条。用墙钟而不是 worker 自己统计的执行时间，因为值得通知的是"调用方等了多久"。
+- **手动**：`pyexec_notify("...")` 发任意一条。适合自动阈值盖不住的情况——几十次短调用加起来的长活、或者开跑长任务前先报备。它等 Telegram 的响应，所以返回的 `ok` 是真的送达结果而不是"已排队"。
+- **后台任务结束**：`pyexec_run_background` / `pyexec_run_script_background` 提交的任务跑完**一律通知**，无视 `PYEXEC_TELEGRAM_MIN_DURATION`，消息里带 job id 和产物的下载链接。阈值存在的理由是"阻塞调用的调用方手里已经有结果了，再来一条是重复"；而主动开后台这个动作本身就是在说"跑完告诉我"，调用方已经明确走开了，这条消息是唯一的报告。
+
+消息长这样：
+
+```
+❌ pyexec_run_script FAILED in 2m12s
+workstation · analysis/sweep.py
+TimeoutError: Execution exceeded 120s and the worker was killed
+
+starting pass 7
+
+(output was truncated by the server's output cap)
+```
+
+后台任务的那条多一个 job id 和产物链接：
+
+```
+✅ pyexec_run_background finished in 8m41s
+workstation · job-1a2b3c4d · nightly sweep
+...
+4000 rows written
+
+🔗 http://192.168.1.10:8000/download/results/sweep.csv?exp=1759046400&sig=9f2c...
+```
+
+链接是从消息末尾往前**整条整条丢**的，不会被截成半截 URL；如果因为太长丢了，会写明还剩几条没列出来。链接排在最后是因为那是要点的东西，而截断正好从尾部开始——不这么处理的话，一条为了交付文件而发的消息反而会把文件弄丢。
+
+几个刻意的选择：
+
+- **通知失败绝不影响运行结果**。消息在结果生成之后、后台线程里发出，任何投递失败只记一条日志。聊天消息是顺手，返回值才是契约。
+- **失败时给出 Telegram 自己的原话**（`chat not found`、`bot was blocked`），因为这两种毛病要在不同地方修。HTTP 200 但 body 里 `{"ok": false}` 也算失败——只看状态码会把这类错误当成功。
+- **带的是输出的结尾而不是开头**：长任务有意义的部分在末尾——最后的进度、最终的数字、异常。而且 Telegram 本身有长度上限（4096），服务端先截到 3500 并注明截断。
+- **令牌不进日志、也不进 `pyexec://config`**：配置里只暴露"启用了没有"、chat id 和阈值。
+- **代理默认跟随环境变量**（`HTTPS_PROXY`）：需要代理才能连上 Telegram 的机器本来就已经配了代理。`PYEXEC_TELEGRAM_PROXY=` 显式设成空值则强制直连，用于"那个代理是给别的流量用的"这种情况。
+- **纯文本、不带 `parse_mode`**：任意代码的输出里全是 Markdown/HTML 的元字符，为了不被 Telegram 拒收而层层转义，对读者一点好处也没有。
+- 用标准库 `urllib` 发，不引额外的 HTTP 客户端，和 `dotenv.py` 的理由一样：这里只需要一个 form POST。
+
+⚠️ 消息内容是**发到 Telegram 服务器**的，等同于发布而不是记日志。输出里如果有密钥、个人信息、客户数据，这条路径会把它带出去——不确定就别开，或者把阈值调高、只靠 `pyexec_notify` 手动发。
+
+---
+
+## 后台任务
+
+阻塞式工具有个硬上限：`PYEXEC_MAX_TIMEOUT` 默认 300 秒，到点 worker 被硬杀。十分钟的 sweep 用阻塞方式根本跑不完，而且调用方得干等十分钟——客户端可能先超时，人也可能在等的时候就走开了。
+
+后台任务是把"等待"从这次执行里拿掉：submit 立刻返回一个 job id，代码在**自己的一次性进程**里继续跑，跑完自动发通知，之后随时能按 id 取回完整结果。
+
+```python
+# 下达
+pyexec_run_background(code, timeout=7200, artifacts=["results/sweep.csv"],
+                      label="nightly sweep")
+# -> ok=True, job_id='job-1a2b3c4d', state='running', notifies=True
+
+# 查
+pyexec_job_status("job-1a2b3c4d")    # state / 耗时 / 输出结尾 / 产物缺没缺
+pyexec_job_status()                  # 不带参数：列出还记着的全部
+
+# 取完整结果（通知里只有输出结尾）
+pyexec_job_result("job-1a2b3c4d")
+pyexec_job_result("job-1a2b3c4d", max_chars=4000)   # 话多的话只要结尾
+
+# 不想要了
+pyexec_job_cancel("job-1a2b3c4d")
+```
+
+几个刻意的选择：
+
+- **每个任务一个独立进程，不碰持久会话**。持久会话是个硬串行点：一次调用整个往返期间持有非重入锁，worker 同时只应答一个请求。让后台任务共用它，要么卡住前台调用，要么被前台调用卡住。所以后台任务走的是 `pyexec_run_isolated` 那条一次性进程的路，代价是**拿不到会话里的变量**——要传数据进去就写文件。
+- **submit 时就把进程拉起来**。多花一次解释器启动（约 100ms，相对一个跑几分钟的任务不算什么），换来两件事：返回后立刻 cancel 有进程可杀，不存在"取消撞上进程还没起来"的竞态；`PYEXEC_PYTHON` 配错了在 submit 当场报错，而不是只出现在一条可能没人看的通知里。
+- **超时用单独的一套旋钮**（`PYEXEC_BACKGROUND_TIMEOUT` / `PYEXEC_BACKGROUND_MAX_TIMEOUT`，默认 1 小时 / 1 天）。要突破的正是阻塞那套的 300 秒，沿用同一把旋钮等于没得配。
+- **并发满了直接拒绝，不排队**。`PYEXEC_MAX_BACKGROUND_JOBS` 默认 4，每个任务都是整台子进程，这是限机器负载而不是限记账。第 5 个提交会返回 `ok=False` 并说明在跑几个，由调用方决定取消哪个——排队会让人以为任务迟早会跑，然后忘了它。
+- **`ok` 是三态**。还在跑的任务 `pyexec_job_status` 里 `ok` 是 `null` 而不是 `false`：`false` 会被读成"失败了"然后说出去。
+- **被拒绝的提交不会创建任务**。import 白名单没过、产物路径越界、脚本不存在、解释器起不来，都在 submit 阶段返回 `ok=False` + `reason`。让一个注定失败的任务跑起来再发一条失败通知，是双重浪费。
+
+**结果在哪**：`PYEXEC_JOB_HISTORY` 默认保留最近 20 个已完成任务的完整 stdout/stderr，每个都受 `PYEXEC_MAX_OUTPUT_CHARS` 限制。超出的从最旧的已完成任务开始丢，在跑的任务永远不丢。
+
+需要说清楚的几件事：
+
+- **记录只在内存里**。服务端一重启，所有 job id 全部失效，查询会告诉你"记录只在内存里"。要留住结果就让它写文件，文件是落在工作区里的。
+- **被取消的任务可能留下半个产物**。进程是直接杀的，没有机会 flush 缓冲或关文件。已经写了的内容留在工作区，server 不会去清理。任务自己起的孙进程也不会跟着一起死。
+- **产物链接要有 `PYEXEC_BASE_URL` 才有用**。它和 `pyexec_get_download_url` 是同一套签名链接，只在客户端能真的访问到那个地址时才能点开；stdout 模式没有地址，链接就不出现。没写出来的产物不会生成链接，但会出现在 `missing_artifacts` 里——声明了却没产出是要说出来的。
+- **`notified=true` 是"已交给投递线程"，不是"已送达"**。投递在后台线程里做，失败只记日志，所以同步的返回值不可能知道送没送到。
+- **换配置会杀掉在跑的任务**。`PYEXEC_WORKSPACE` 一变，任务的 worker 工作目录就指向一个没人再看的地方了，所以配置替换时后台任务一律中止（且不发通知）。
+
+---
+
 ## 安全边界
 
 **这不是沙箱，请当它没有隔离来用。** 这个 server 的全部意义就是执行任意 Python，而任意 Python 可以绕过任何运行在同一解释器内的检查——`PYEXEC_ALLOWED_MODULES` 挡得住手滑，挡不住存心。代码跑起来后，它对这台机器的权限和 server 进程本身完全一样。
@@ -259,17 +389,19 @@ curl -sS --noproxy '*' -O -J "http://127.0.0.1:8000/download/chart.png?exp=...&s
 MCP client
     │  stdio / streamable-http
     ▼
-server.py          MCPServer + 11 个工具，把 Settings 和 Session 串起来
+server.py          MCPServer + 17 个工具，把 Settings、Session、JobManager 串起来
     │
     ├── auth.py       streamable-http 的 Bearer 中间件 + 启动联锁
     ├── downloads.py  /download 前置门：签名链接、路径囚笼、FileResponse
+    ├── telegram.py   长时间运行结束后的 Telegram 通知（后台线程，失败只记日志）
+    ├── jobs.py       后台任务登记表：独立进程、取消、有界历史
     ├── config.py     Settings：环境变量 → 配置，含令牌校验与 base URL 推导
     ├── dotenv.py     极简 .env 读取（不引 python-dotenv）
     ├── sandbox.py     AST import 白名单、路径囚笼（进 worker 之前）
     ├── packages.py    pip 安装 / 列举
     │
     ▼  一行一个 JSON，stdout 上带 nonce 的帧
-session.py         每个会话一个 worker 子进程，串行化调用，超时硬杀
+session.py         每个会话一个 worker 子进程，串行化调用，超时硬杀；后台任务各用一个跑完即弃
     │
     ▼
 worker.py          独立的子进程：ast 解析 → exec → 捕获输出 → 回帧
@@ -301,3 +433,4 @@ worker.py          独立的子进程：ast 解析 → exec → 捕获输出 →
 - 超时后的行为分两种情况，返回值里的 `session_restarted` 会告诉你是哪种：纯 Python 循环会被就地打断，**会话和变量都保留**；卡在阻塞式 C 调用里的代码打断不了，只能杀掉进程，**会话被重置、之前的变量丢失**。别假设，看这个字段。
 - `pyexec_install_package` 装进的是 `PYEXEC_PYTHON` 指向的解释器。如果用 `uvx` 之类启动 server，那可能是个临时环境，装完就没了——这种情况建议显式设置 `PYEXEC_PYTHON`。命令会优先用 `uv pip install`（因为 `uv venv` 建的环境里根本没有 pip）。
 - Windows 上 worker 的输出统一按 UTF-8 处理（子进程强制 `PYTHONIOENCODING=utf-8`），避免中文 locale 下 cp936 把帧搅乱。
+- 后台任务的记录只在内存里，服务端重启即全部失效；被取消的任务可能在工作区留下半个产物文件。细节见上面的「后台任务」。

@@ -174,6 +174,39 @@ class ExecutionSession:
                 pass
         self._terminate()
 
+    def start(self) -> None:
+        """Start the worker now instead of on the first request.
+
+        :meth:`request` spawns lazily, which is right for a caller that is
+        about to block on it anyway. A background job is different: it hands a
+        cancel button to someone else the moment it returns, and a cancel that
+        arrives before the worker exists has nothing to kill. Starting here
+        costs an interpreter launch on the submit path and buys a cancellation
+        with no window in it -- plus a broken ``PYEXEC_PYTHON`` that fails at
+        submit, where the caller can see it, rather than only in a notification
+        nobody may be reading.
+
+        Raises:
+            SessionError: if the interpreter could not be started.
+        """
+        with self._lock:
+            if not self.alive:
+                self._spawn()
+
+    def abort(self) -> None:
+        """Kill the worker without the graceful shutdown handshake.
+
+        Cancellation lands while the worker may be mid-write, and a
+        ``shutdown`` frame racing the in-flight request down the same pipe
+        would be a coin toss for no benefit. The blocked :meth:`_exchange`
+        sees end-of-file and reports a dead worker, which is exactly what
+        happened.
+
+        Safe to call from another thread: :meth:`_terminate` swaps ``_proc``
+        out before touching it, so a concurrent call finds nothing to do.
+        """
+        self._terminate()
+
     # -- transport ---------------------------------------------------------
 
     def _send(self, request: dict[str, Any]) -> None:
@@ -222,7 +255,12 @@ class ExecutionSession:
     def _exchange(
         self, op: str, deadline: float, restarted: bool, **fields: Any
     ) -> CallResult:
-        assert self._frames is not None
+        # Captured once: another thread may call close() or abort() while this
+        # loop is parked in get(), and _terminate() clears the attribute. A
+        # re-read per iteration would raise AttributeError instead of returning
+        # the dead-worker result that actually describes what happened.
+        frames = self._frames
+        assert frames is not None
         request = {"id": next(self._ids), "op": op, "timeout": deadline, **fields}
         try:
             self._send(request)
@@ -250,7 +288,7 @@ class ExecutionSession:
                 return self._timeout_result(deadline, chunks, restarted)
 
             try:
-                kind, item = self._frames.get(timeout=remaining)
+                kind, item = frames.get(timeout=remaining)
             except queue.Empty:
                 return self._timeout_result(deadline, chunks, restarted)
 
